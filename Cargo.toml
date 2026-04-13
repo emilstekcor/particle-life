@@ -1,0 +1,39 @@
+[package]
+name = "particle_life_3d"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Window creation and event loop
+winit = "0.29"
+
+# GPU / compute shaders
+wgpu = "0.19"
+
+# UI panels
+egui = "0.26"
+egui-wgpu = "0.26"
+egui-winit = "0.26"
+
+# Math (vectors, matrices)
+glam = "0.25"
+
+# Safe byte casting for GPU buffers
+bytemuck = { version = "1.15", features = ["derive"] }
+
+# Serialization for book.json
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random number generation (particle spawning)
+rand = "0.8"
+
+# Async runtime (wgpu needs it for init)
+pollster = "0.3"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
