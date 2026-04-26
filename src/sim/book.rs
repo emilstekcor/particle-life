@@ -43,6 +43,7 @@ impl Prefab {
 pub struct Book {
     pub prefabs: Vec<Prefab>,
     pub path: String,
+    dirty: bool,
 }
 
 impl Book {
@@ -50,6 +51,7 @@ impl Book {
         Self {
             prefabs: Vec::new(),
             path: "book.json".to_string(),
+            dirty: false,
         }
     }
 
@@ -87,15 +89,26 @@ impl Book {
         }
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn flush_if_dirty(&mut self) {
+        if self.dirty {
+            self.save_to_file();
+            self.dirty = false;
+        }
+    }
+
     pub fn add_prefab(&mut self, prefab: Prefab) {
         self.prefabs.push(prefab);
-        self.save_to_file();
+        self.mark_dirty();
     }
 
     pub fn remove_prefab(&mut self, index: usize) {
         if index < self.prefabs.len() {
             self.prefabs.remove(index);
-            self.save_to_file();
+            self.mark_dirty();
         }
     }
 }

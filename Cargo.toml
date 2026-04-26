@@ -28,6 +28,9 @@ serde_json = "1"
 # Random number generation (particle spawning)
 rand = "0.8"
 
+# User data directories
+dirs = "5"
+
 # Async runtime (wgpu needs it for init)
 pollster = "0.3"
 
