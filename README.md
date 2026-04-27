@@ -1,4 +1,4 @@
-I feel it merits mentioning that I used ai for massive portions of thos project specifically in porting over my already existing code from c++. I frankly did't have the time to figure out prarallel processing syntaxes in rust and just had an ai implement the build features in what I had made.I consider it a miracle it works and I will keep this as a notice and warning.  
+I feel it merits mentioning that I used ai for massive portions of this project specifically in porting over my already existing code from c++. I frankly did't have the time to figure out prarallel processing syntaxes in rust and just had an ai implement the build features in what I had made.I consider it a miracle it works and I will keep this as a notice and warning.  
 
 
 
