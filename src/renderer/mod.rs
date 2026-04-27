@@ -231,6 +231,7 @@ impl Renderer {
             gpu_params.count = particle_count;
             self.compute.upload_params(&self.queue, &gpu_params);
             self.compute.upload_rules(&self.queue, &sim.force_matrix);
+            self.compute.upload_reactions(&self.queue, &sim.reaction_table);
 
             sim.particles_dirty = false;
             sim.params_dirty = false;
@@ -240,6 +241,7 @@ impl Renderer {
             gpu_params.count = self.compute.particle_count;
             self.compute.upload_params(&self.queue, &gpu_params);
             self.compute.upload_rules(&self.queue, &sim.force_matrix);
+            self.compute.upload_reactions(&self.queue, &sim.reaction_table);
 
             sim.params_dirty = false;
             sim.force_matrix_dirty = false;
@@ -248,10 +250,11 @@ impl Renderer {
         // Upload GPU selection parameters
         self.compute.upload_selection_params(&self.queue, &ui.gpu_selection_params);
 
-        // Clear selection when not selecting
-        if ui.gpu_selection_params.mode == 0 {
-            self.compute.clear_selection(&self.queue, self.compute.particle_count);
-        }
+        // Do not clear every frame. This is expensive at high particle counts.
+        // Clear only when selection mode changes, particles are reset, or user presses Clear Selection.
+        // if ui.gpu_selection_params.mode == 0 {
+        //     self.compute.clear_selection(&self.queue, self.compute.particle_count);
+        // }
 
         // 3) Sync UI state into compute trail parameters
         // Clear trail history when enabling trails mid-sim to avoid garbage
@@ -319,6 +322,7 @@ impl Renderer {
             self.compute.trail_valid_len,
             load_op,
             &view,  // always the swapchain view
+            sim,
         );
 
         // 6) Draw egui on top

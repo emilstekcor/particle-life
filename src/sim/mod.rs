@@ -72,6 +72,7 @@ pub struct SimParams {
     pub wrap: bool,
     pub max_speed: f32,
     pub beta: f32,
+    pub particle_size: f32,
 
     // CPU stepping controls
     pub cpu_step_mode: CpuStepMode,
@@ -96,15 +97,33 @@ impl Default for SimParams {
             wrap: true,
             max_speed: 0.5,
             beta: 0.30,
+            particle_size: 0.02,
 
             cpu_step_mode: CpuStepMode::Auto,
             auto_grid_threshold: 500,
 
             reactions_enabled: false,
-            mix_radius: 0.1,
+            mix_radius: 0.15,
             reaction_probability: 0.1,
             preserve_particle_count: false,
         }
+    }
+}
+
+impl SimParams {
+    /// Get the actual r_max scaled by bounds
+    pub fn scaled_r_max(&self) -> f32 {
+        self.r_max * self.bounds / 20.0
+    }
+    
+    /// Get the actual mix_radius scaled by bounds
+    pub fn scaled_mix_radius(&self) -> f32 {
+        self.mix_radius * self.bounds / 20.0
+    }
+    
+    /// Get the actual max_speed scaled by bounds
+    pub fn scaled_max_speed(&self) -> f32 {
+        self.max_speed * self.bounds / 20.0
     }
 }
 
@@ -124,6 +143,7 @@ pub struct SimState {
     // Scratch buffers for performance (reused each frame)
     pub vel_scratch: Vec<[f32; 3]>,
     pub buckets_scratch: Vec<Vec<usize>>,
+    pub reaction_changes_scratch: Vec<(usize, u32)>,
 
     // Debug/telemetry for later UI
     pub last_step_used_grid: bool,
@@ -152,6 +172,7 @@ impl SimState {
 
             vel_scratch: Vec::new(),
             buckets_scratch: Vec::new(),
+            reaction_changes_scratch: Vec::new(),
 
             last_step_used_grid: false,
             last_neighbor_checks: 0,

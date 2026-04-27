@@ -7,11 +7,13 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) size: f32,
 };
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
+    particle_size: f32,
 };
 
 @group(0) @binding(0)
@@ -42,8 +44,10 @@ fn main(input: VertexInput) -> VertexOutput {
     
     if (is_selected) {
         output.color = vec3<f32>(1.0, 1.0, 1.0); // White for selected
+        output.size = camera.particle_size * 1.5; // Make selected particles slightly larger
     } else {
         output.color = type_color(input.kind);
+        output.size = camera.particle_size;
     }
     
     return output;

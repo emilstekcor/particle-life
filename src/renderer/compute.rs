@@ -6,18 +6,22 @@ pub const MAX_TYPES: usize = 32;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuParams {
-    pub dt:          f32,
-    pub r_max:       f32,
-    pub force_scale: f32,
-    pub friction:    f32,
-    pub beta:        f32,
-    pub bounds:      f32,
-    pub max_speed:   f32,
-    pub type_count:  u32,
-    pub count:       u32,
-    pub wrap:        u32,
-    pub _pad0:       u32,
-    pub _pad1:       u32,
+    pub dt:                   f32,
+    pub r_max:                f32,
+    pub force_scale:          f32,
+    pub friction:             f32,
+    pub beta:                 f32,
+    pub bounds:               f32,
+    pub max_speed:            f32,
+    pub type_count:           u32,
+    pub count:                u32,
+    pub wrap:                 u32,
+    pub reactions_enabled:    u32,
+    pub mix_radius:           f32,
+    pub reaction_probability: f32,
+    pub _pad0:                u32,
+    pub _pad1:                u32,
+    pub _pad2:                u32,
 }
 
 #[repr(C)]
@@ -74,8 +78,12 @@ impl From<&SimParams> for GpuParams {
             type_count: params.type_count as u32,
             count: 0, // Must be set explicitly based on particle count
             wrap: if params.wrap { 1 } else { 0 },
+            reactions_enabled: if params.reactions_enabled { 1 } else { 0 },
+            mix_radius: params.mix_radius,
+            reaction_probability: params.reaction_probability,
             _pad0: 0,
             _pad1: 0,
+            _pad2: 0,
         }
     }
 }
@@ -88,6 +96,7 @@ pub struct ComputePipeline {
     pub particle_buf:   wgpu::Buffer,   // ping buffer (positions+vel live here)
     params_buf:         wgpu::Buffer,
     rules_buf:          wgpu::Buffer,
+    reaction_buf:       wgpu::Buffer,   // reaction table (i32 per type pair)
     pub selection_buf:  wgpu::Buffer,   // selection flags (1 byte per particle)
     selection_params_buf: wgpu::Buffer, // selection parameters
     readback_buf:       wgpu::Buffer,   // staging buffer for GPU->CPU readback
@@ -174,6 +183,17 @@ impl ComputePipeline {
                     },
                     count: None,
                 },
+                // Reaction table buffer (storage, read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -215,6 +235,14 @@ impl ComputePipeline {
         let rules_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Rules Buffer"),
             size: (MAX_TYPES * MAX_TYPES * mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create reaction buffer (max MAX_TYPES×MAX_TYPES)
+        let reaction_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Reaction Buffer"),
+            size: (MAX_TYPES * MAX_TYPES * std::mem::size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -364,6 +392,10 @@ impl ComputePipeline {
                     binding: 4,
                     resource: selection_params_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: reaction_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -374,6 +406,7 @@ impl ComputePipeline {
             particle_buf,
             params_buf,
             rules_buf,
+            reaction_buf,
             selection_buf,
             selection_params_buf,
             readback_buf,
@@ -424,6 +457,10 @@ impl ComputePipeline {
         );
 
         queue.write_buffer(&self.rules_buf, 0, bytemuck::cast_slice(rules));
+    }
+
+    pub fn upload_reactions(&self, queue: &wgpu::Queue, table: &[i32]) {
+        queue.write_buffer(&self.reaction_buf, 0, bytemuck::cast_slice(table));
     }
 
     pub fn upload_selection_params(&self, queue: &wgpu::Queue, params: &SelectionParams) {

@@ -6,18 +6,22 @@ struct Particle {
 };
 
 struct Params {
-    dt:          f32,
-    r_max:       f32,
-    force_scale: f32,
-    friction:    f32,
-    beta:        f32,
-    bounds:      f32,
-    max_speed:   f32,
-    type_count:  u32,
-    count:       u32,
-    wrap:        u32,   // 0 or 1
-    _pad0:       u32,
-    _pad1:       u32,
+    dt:                   f32,
+    r_max:                f32,
+    force_scale:          f32,
+    friction:             f32,
+    beta:                 f32,
+    bounds:               f32,
+    max_speed:            f32,
+    type_count:           u32,
+    count:                u32,
+    wrap:                 u32,   // 0 or 1
+    reactions_enabled:    u32,
+    mix_radius:           f32,
+    reaction_probability: f32,
+    _pad0:                u32,
+    _pad1:                u32,
+    _pad2:                u32,
 };
 
 struct SelectionParams {
@@ -39,6 +43,7 @@ struct SelectionParams {
 @group(0) @binding(2) var<storage, read>       rules:     array<f32>;
 @group(0) @binding(3) var<storage, read_write> selection: array<u32>;
 @group(0) @binding(4) var<uniform>             sel_params: SelectionParams;
+@group(0) @binding(5) var<storage, read>       reaction_table: array<i32>;
 
 fn wrap_delta(d: f32, bounds: f32) -> f32 {
     let half = bounds * 0.5;
@@ -118,6 +123,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Wrap
     if params.wrap != 0u {
         pos = (pos % params.bounds + params.bounds) % params.bounds;
+    }
+
+    // Reactions
+    if params.reactions_enabled != 0u {
+        let mix_r_sq = params.mix_radius * params.mix_radius;
+        let ri = particles[i].kind;
+
+        for (var j = 0u; j < params.count; j++) {
+            if j == i { continue; }
+
+            var dx = particles[j].position.x - pos.x;
+            var dy = particles[j].position.y - pos.y;
+            var dz = particles[j].position.z - pos.z;
+
+            if params.wrap != 0u {
+                let half = params.bounds * 0.5;
+                if dx >  half { dx -= params.bounds; }
+                if dx < -half { dx += params.bounds; }
+                if dy >  half { dy -= params.bounds; }
+                if dy < -half { dy += params.bounds; }
+                if dz >  half { dz -= params.bounds; }
+                if dz < -half { dz += params.bounds; }
+            }
+
+            let dist_sq = dx*dx + dy*dy + dz*dz;
+            if dist_sq > mix_r_sq { continue; }
+
+            let rj = particles[j].kind;
+            let result = reaction_table[ri * params.type_count + rj];
+            if result >= 0 {
+                // Use a deterministic per-pair hash as a cheap "random" gate
+                let hash = (i * 2654435761u + j * 2246822519u + u32(params.dt * 1000.0)) & 0xFFFFu;
+                let threshold = u32(params.reaction_probability * 65535.0);
+                if hash < threshold {
+                    particles[i].kind = u32(result);
+                }
+            }
+        }
     }
 
     // Write back

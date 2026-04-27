@@ -35,9 +35,10 @@ impl Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    view_proj:  [[f32; 4]; 4],
-    camera_pos: [f32; 3],
-    _padding:   f32,
+    view_proj:    [[f32; 4]; 4],
+    camera_pos:   [f32; 3],
+    particle_size: f32,
+    _padding:     f32,
 }
 
 pub struct DrawPipeline {
@@ -457,8 +458,9 @@ impl DrawPipeline {
         trail_valid_len: u32,
         load_op:       wgpu::LoadOp<wgpu::Color>,
         particle_target: &wgpu::TextureView,  // Target for particle rendering (trace texture or swapchain)
+        sim:            &crate::sim::SimState,
     ) {
-        let (uniform, view_matrix, view_proj) = self.build_camera(ui, screen_desc);
+        let (uniform, view_matrix, view_proj) = self.build_camera(ui, screen_desc, sim.params.particle_size);
         ui.view_matrix = view_matrix;
         ui.view_proj   = view_proj;
         ui.viewport    = screen_desc.size_in_pixels;
@@ -550,6 +552,7 @@ impl DrawPipeline {
         &self,
         ui:          &UiState,
         screen_desc: &ScreenDescriptor,
+        particle_size: f32,
     ) -> (CameraUniform, Mat4, Mat4) {
         let pos    = ui.fly_pos;
         let target = pos + ui.fly_forward();
@@ -567,9 +570,10 @@ impl DrawPipeline {
 
         let view_proj = proj * view;
         let uniform   = CameraUniform {
-            view_proj:  view_proj.to_cols_array_2d(),
-            camera_pos: pos.to_array(),
-            _padding:   0.0,
+            view_proj:    view_proj.to_cols_array_2d(),
+            camera_pos:   pos.to_array(),
+            particle_size: particle_size,
+            _padding:     0.0,
         };
         (uniform, view, view_proj)
     }

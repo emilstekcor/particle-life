@@ -1,5 +1,6 @@
 use crate::sim::{CpuStepMode, SimState};
 use std::time::Instant;
+use rand::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolvedStepMode {
@@ -39,6 +40,9 @@ pub fn cpu_step(state: &mut SimState) {
         ResolvedStepMode::GridExact => cpu_step_grid_exact(state),
     };
 
+    // Apply reactions after physics integration
+    apply_reactions(state);
+
     state.last_step_used_grid = stats.used_grid;
     state.last_neighbor_checks = stats.neighbor_checks;
     state.last_grid_res = stats.grid_res;
@@ -74,14 +78,14 @@ fn cpu_step_naive(state: &mut SimState) -> StepStats {
     }
 
     let dt = state.params.dt;
-    let r_max = state.params.r_max;
+    let r_max = state.params.scaled_r_max();
     let r_max_sq = r_max * r_max;
     let force_scale = state.params.force_scale;
     let friction = state.params.friction;
     let wrap = state.params.wrap;
     let bounds = state.params.bounds;
     let beta = state.params.beta;
-    let max_speed = state.params.max_speed;
+    let max_speed = state.params.scaled_max_speed();
     let type_count = state.params.type_count;
 
     let damping = friction.powf(dt * 60.0);
@@ -132,7 +136,12 @@ fn cpu_step_naive(state: &mut SimState) -> StepStats {
             let a = if dn < beta {
                 dn / beta - 1.0
             } else {
-                let attr = state.force_matrix[pi_kind * type_count + pj_kind];
+                let matrix_index = pi_kind * type_count + pj_kind;
+                let attr = if matrix_index < state.force_matrix.len() {
+                    state.force_matrix[matrix_index]
+                } else {
+                    0.0 // Default to neutral force if out of bounds
+                };
                 attr * (1.0 - ((2.0 * dn - 1.0 - beta) / (1.0 - beta)).abs())
             };
 
@@ -182,14 +191,14 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
     }
 
     let dt = state.params.dt;
-    let r_max = state.params.r_max;
+    let r_max = state.params.scaled_r_max();
     let r_max_sq = r_max * r_max;
     let force_scale = state.params.force_scale;
     let friction = state.params.friction;
     let wrap = state.params.wrap;
     let bounds = state.params.bounds;
     let beta = state.params.beta;
-    let max_speed = state.params.max_speed;
+    let max_speed = state.params.scaled_max_speed();
     let type_count = state.params.type_count;
 
     let damping = friction.powf(dt * 60.0);
@@ -263,7 +272,12 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
                         let a = if dn < beta {
                             dn / beta - 1.0
                         } else {
-                            let attr = state.force_matrix[pi_kind * type_count + pj_kind];
+                            let matrix_index = pi_kind * type_count + pj_kind;
+                            let attr = if matrix_index < state.force_matrix.len() {
+                                state.force_matrix[matrix_index]
+                            } else {
+                                0.0 // Default to neutral force if out of bounds
+                            };
                             attr * (1.0 - ((2.0 * dn - 1.0 - beta) / (1.0 - beta)).abs())
                         };
 
@@ -377,6 +391,102 @@ fn neighbor_axis(axis: usize, delta: isize, grid_res: usize, wrap: bool) -> Opti
             None
         } else {
             Some(v as usize)
+        }
+    }
+}
+
+pub fn apply_reactions(state: &mut SimState) {
+    if !state.params.reactions_enabled {
+        return;
+    }
+
+    let mix_r = state.params.scaled_mix_radius();
+    let mix_r_sq = mix_r * mix_r;
+    let prob = state.params.reaction_probability;
+    let n = state.params.type_count;
+    let bounds = state.params.bounds;
+    let wrap = state.params.wrap;
+    let count = state.particles.len();
+    if count == 0 { return; }
+
+    let mut rng = rand::thread_rng();
+    state.reaction_changes_scratch.clear();
+
+    // Reuse the grid that was just built in cpu_step_grid_exact.
+    // If buckets_scratch is empty (naive mode or first frame), fall back gracefully.
+    let use_grid = !state.buckets_scratch.is_empty();
+
+    if use_grid {
+        let grid_res = state.last_grid_res.max(1);
+
+        for i in 0..count {
+            let pi_pos = state.particles[i].position;
+            let ri = state.particles[i].kind as usize;
+            let [cx, cy, cz] = cell_coords(pi_pos, bounds, grid_res, wrap);
+
+            for ox in -1isize..=1 {
+                let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else { continue };
+                for oy in -1isize..=1 {
+                    let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else { continue };
+                    for oz in -1isize..=1 {
+                        let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else { continue };
+                        let nid = cell_index(nx, ny, nz, grid_res);
+                        if nid < state.buckets_scratch.len() {
+                            for &j in &state.buckets_scratch[nid] {
+                                if j <= i { continue; } // each pair once
+
+                            let pj = &state.particles[j];
+                            let mut dx = pj.position[0] - pi_pos[0];
+                            let mut dy = pj.position[1] - pi_pos[1];
+                            let mut dz = pj.position[2] - pi_pos[2];
+                            if wrap {
+                                dx = wrap_delta(dx, bounds);
+                                dy = wrap_delta(dy, bounds);
+                                dz = wrap_delta(dz, bounds);
+                            }
+                            let dist_sq = dx*dx + dy*dy + dz*dz;
+                            if dist_sq > mix_r_sq { continue; }
+
+                            let rj = pj.kind as usize;
+                            let result_ij = state.reaction_table[ri * n + rj];
+                            let result_ji = state.reaction_table[rj * n + ri];
+                            if result_ij >= 0 && rng.gen::<f32>() < prob {
+                                state.reaction_changes_scratch.push((i, result_ij as u32));
+                            }
+                            if result_ji >= 0 && rng.gen::<f32>() < prob {
+                                state.reaction_changes_scratch.push((j, result_ji as u32));
+                            }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Naive fallback (small N)
+        for i in 0..count {
+            for j in (i+1)..count {
+                let pi = &state.particles[i];
+                let pj = &state.particles[j];
+                let mut dx = pj.position[0] - pi.position[0];
+                let mut dy = pj.position[1] - pi.position[1];
+                let mut dz = pj.position[2] - pi.position[2];
+                if wrap { dx = wrap_delta(dx, bounds); dy = wrap_delta(dy, bounds); dz = wrap_delta(dz, bounds); }
+                let dist_sq = dx*dx + dy*dy + dz*dz;
+                if dist_sq > mix_r_sq { continue; }
+                let ri = pi.kind as usize;
+                let rj = pj.kind as usize;
+                let result_ij = state.reaction_table[ri * n + rj];
+                let result_ji = state.reaction_table[rj * n + ri];
+                if result_ij >= 0 && rng.gen::<f32>() < prob { state.reaction_changes_scratch.push((i, result_ij as u32)); }
+                if result_ji >= 0 && rng.gen::<f32>() < prob { state.reaction_changes_scratch.push((j, result_ji as u32)); }
+            }
+        }
+    }
+
+    for (idx, new_kind) in state.reaction_changes_scratch.drain(..) {
+        if idx < state.particles.len() {
+            state.particles[idx].kind = new_kind;
         }
     }
 }

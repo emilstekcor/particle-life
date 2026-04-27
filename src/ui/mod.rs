@@ -7,6 +7,7 @@ pub struct UiState {
     pub paused:    bool,
     pub step_once: bool,
     pub use_gpu_physics: bool,
+    pub cap_to_bounds: bool,
 
     // ── Free-fly camera ───────────────────────────────────────────────────────
     pub fly_pos:   Vec3,
@@ -82,6 +83,7 @@ impl UiState {
             paused:    false,
             step_once: false,
             use_gpu_physics: false,
+            cap_to_bounds: true,
 
             fly_pos:   Vec3::new(0.5, 0.5, 2.0),
             fly_yaw:   -std::f32::consts::PI / 2.0, // Point toward -Z (center)
@@ -413,13 +415,17 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                 if nc != sim.params.type_count { sim.set_type_count(nc); }
             }
 
-            changed |= e.add(Slider::new(&mut sim.params.r_max,       0.001..=1.0 ).text("r_max")).changed();
+            let r_max_max = if ui.cap_to_bounds { sim.params.bounds } else { 20.0 };
+            changed |= e.add(Slider::new(&mut sim.params.r_max,       0.001..=r_max_max ).text("r_max")).changed();
             changed |= e.add(Slider::new(&mut sim.params.force_scale,  0.0  ..=20.0).text("force scale")).changed();
             changed |= e.add(Slider::new(&mut sim.params.friction,     0.0  ..=1.0 ).text("friction")).changed();
             changed |= e.add(Slider::new(&mut sim.params.dt,           0.0001..=0.1).text("dt")).changed();
-            changed |= e.add(Slider::new(&mut sim.params.max_speed,    0.01 ..=10.0).text("max speed")).changed();
+            let max_speed_max = if ui.cap_to_bounds { sim.params.bounds } else { 20.0 };
+            changed |= e.add(Slider::new(&mut sim.params.max_speed,    0.01 ..=max_speed_max).text("max speed")).changed();
             changed |= e.add(Slider::new(&mut sim.params.beta,         0.01 ..=0.99).text("beta")).changed();
+            changed |= e.add(Slider::new(&mut sim.params.particle_size, 0.001..=0.2).text("particle size")).changed();
             changed |= e.add(Slider::new(&mut sim.params.bounds,       0.1  ..=20.0).text("bounds")).changed();
+            changed |= e.checkbox(&mut ui.cap_to_bounds, "Cap sliders to bounds").changed();
             changed |= e.checkbox(&mut sim.params.wrap, "Wrap").changed();
 
             e.separator();
@@ -717,7 +723,7 @@ fn draw_rule_matrix(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
 }
 
 // ── Reaction Matrix panel ───────────────────────────────────────────────────────
-fn draw_reaction_matrix(ctx: &Context, sim: &mut SimState, _ui: &mut UiState) {
+fn draw_reaction_matrix(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
     let n  = sim.params.type_count;
     let _dt = ctx.input(|i| i.stable_dt);
 
@@ -740,7 +746,8 @@ fn draw_reaction_matrix(ctx: &Context, sim: &mut SimState, _ui: &mut UiState) {
             });
             
             e.horizontal(|e| {
-                e.add(Slider::new(&mut sim.params.mix_radius, 0.01..=1.0).text("mix radius"));
+                let mix_radius_max = if ui.cap_to_bounds { sim.params.bounds } else { 20.0 };
+                e.add(Slider::new(&mut sim.params.mix_radius, 0.01..=mix_radius_max).text("mix radius"));
                 e.add(Slider::new(&mut sim.params.reaction_probability, 0.01..=1.0).text("probability"));
             });
             

@@ -87,15 +87,18 @@ fn main() {
                             }
                         }
 
-                        // Sync GPU selection with CPU selected_indices only when needed and not during active selection
-                        if ui.selection_readback_needed && !ui.is_selecting {
-                            renderer.sync_selection(&mut ui);
-                        }
+                        // TEMP DISABLED: GPU readback stalls the frame hard.
+                        // Only re-enable when selection actually needs CPU-side selected_indices.
+                        // if ui.selection_readback_needed && !ui.is_selecting {
+                        //     renderer.sync_selection(&mut ui);
+                        // }
                         
                         renderer.render(&window, &mut sim, &mut ui);
                         
-                        // Save crash profile after each frame for debugging
-                        crash_profile::save_crash_profile(&sim, &ui);
+                        // Only save crash profile every 500 steps to avoid blocking I/O stalls
+                        if sim.step_count % 500 == 0 {
+                            crash_profile::save_crash_profile(&sim, &ui);
+                        }
                         
                         // Flush book saving if dirty (deferred I/O to avoid blocking UI)
                         sim.book.flush_if_dirty();
