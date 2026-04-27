@@ -6,42 +6,42 @@ pub const MAX_TYPES: usize = 32;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuParams {
-    pub dt:                   f32,
-    pub r_max:                f32,
-    pub force_scale:          f32,
-    pub friction:             f32,
-    pub beta:                 f32,
-    pub bounds:               f32,
-    pub max_speed:            f32,
-    pub type_count:           u32,
-    pub count:                u32,
-    pub wrap:                 u32,
-    pub reactions_enabled:    u32,
-    pub mix_radius:           f32,
+    pub dt: f32,
+    pub r_max: f32,
+    pub force_scale: f32,
+    pub friction: f32,
+    pub beta: f32,
+    pub bounds: f32,
+    pub max_speed: f32,
+    pub type_count: u32,
+    pub count: u32,
+    pub wrap: u32,
+    pub reactions_enabled: u32,
+    pub mix_radius: f32,
     pub reaction_probability: f32,
-    pub _pad0:                u32,
-    pub _pad1:                u32,
-    pub _pad2:                u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SelectionParams {
-    pub mode:         u32,
-    pub _pad0:        [u32; 3],        // align to 16 bytes
+    pub mode: u32,
+    pub _pad0: [u32; 3], // align to 16 bytes
 
-    pub rect_min:     [f32; 2],
-    pub _pad1:        [f32; 2],
+    pub rect_min: [f32; 2],
+    pub _pad1: [f32; 2],
 
-    pub rect_max:     [f32; 2],
-    pub _pad2:        [f32; 2],
+    pub rect_max: [f32; 2],
+    pub _pad2: [f32; 2],
 
     pub brush_center: [f32; 2],
-    pub _pad3:        [f32; 2],
+    pub _pad3: [f32; 2],
 
     pub brush_radius: f32,
-    pub slice_depth:  f32,
-    pub _pad4:        [f32; 2],
+    pub slice_depth: f32,
+    pub _pad4: [f32; 2],
 }
 
 #[repr(C)]
@@ -89,17 +89,23 @@ impl From<&SimParams> for GpuParams {
 }
 
 pub struct ComputePipeline {
-    pipeline:           wgpu::ComputePipeline,
-    bind_group_layout:  wgpu::BindGroupLayout,
-    bind_group:         wgpu::BindGroup,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pub compute_bind_groups: [wgpu::BindGroup; 2],
 
-    pub particle_buf:   wgpu::Buffer,   // ping buffer (positions+vel live here)
-    params_buf:         wgpu::Buffer,
-    rules_buf:          wgpu::Buffer,
-    reaction_buf:       wgpu::Buffer,   // reaction table (i32 per type pair)
-    pub selection_buf:  wgpu::Buffer,   // selection flags (1 byte per particle)
+    pub particle_buffers: [wgpu::Buffer; 2], // ping-pong particle buffers
+    pub particle_read_index: usize,
+    pub particle_write_index: usize,
+
+    params_buf: wgpu::Buffer,
+    rules_buf: wgpu::Buffer,
+    reaction_buf: wgpu::Buffer,      // reaction table (i32 per type pair)
+    pub trace_len_buf: wgpu::Buffer, // trace length matrix (u32 per type pair)
+    pub trace_timer_buf: wgpu::Buffer, // trace timers (u32 per particle)
+    pub trace_prev_pos_buf: wgpu::Buffer, // trace previous positions (vec3 per particle)
+    pub selection_buf: wgpu::Buffer, // selection flags (1 byte per particle)
     selection_params_buf: wgpu::Buffer, // selection parameters
-    readback_buf:       wgpu::Buffer,   // staging buffer for GPU->CPU readback
+    readback_buf: wgpu::Buffer,      // staging buffer for GPU->CPU readback
 
     // Trail system
     pub trail_history_buf: wgpu::Buffer,
@@ -128,9 +134,20 @@ impl ComputePipeline {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
             entries: &[
-                // Particle buffer (storage, read_write)
+                // Particle buffer read (storage, read)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Particle buffer write (storage, read_write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -141,7 +158,7 @@ impl ComputePipeline {
                 },
                 // Params buffer (uniform)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -152,7 +169,7 @@ impl ComputePipeline {
                 },
                 // Rules buffer (storage, read)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -163,7 +180,7 @@ impl ComputePipeline {
                 },
                 // Selection flags buffer (storage, read_write)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -174,7 +191,7 @@ impl ComputePipeline {
                 },
                 // Selection parameters buffer (uniform)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4,
+                    binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -185,10 +202,43 @@ impl ComputePipeline {
                 },
                 // Reaction table buffer (storage, read)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Trace length matrix buffer (storage, read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Trace timer buffer (storage, read_write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Trace previous position buffer (storage, read_write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -212,16 +262,27 @@ impl ComputePipeline {
             entry_point: "main",
         });
 
-        // Create particle buffer (shared with renderer for zero-copy)
-        let particle_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Particle Buffer"),
-            size: (max_particles * mem::size_of::<GpuParticle>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE    // compute reads/writes
-                 | wgpu::BufferUsages::VERTEX     // render reads
-                 | wgpu::BufferUsages::COPY_DST   // initial upload
-                 | wgpu::BufferUsages::COPY_SRC,  // GPU->CPU readback
-            mapped_at_creation: false,
-        });
+        // Create two particle buffers for ping-pong
+        let particle_buffers = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Particle Buffer A"),
+                size: (max_particles * mem::size_of::<GpuParticle>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE    // compute reads/writes
+                     | wgpu::BufferUsages::VERTEX     // render reads
+                     | wgpu::BufferUsages::COPY_DST   // initial upload
+                     | wgpu::BufferUsages::COPY_SRC, // GPU->CPU readback
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Particle Buffer B"),
+                size: (max_particles * mem::size_of::<GpuParticle>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE    // compute reads/writes
+                     | wgpu::BufferUsages::VERTEX     // render reads
+                     | wgpu::BufferUsages::COPY_DST   // initial upload
+                     | wgpu::BufferUsages::COPY_SRC, // GPU->CPU readback
+                mapped_at_creation: false,
+            }),
+        ];
 
         // Create params buffer
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -243,6 +304,30 @@ impl ComputePipeline {
         let reaction_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Reaction Buffer"),
             size: (MAX_TYPES * MAX_TYPES * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create trace length buffer (max MAX_TYPES×MAX_TYPES)
+        let trace_len_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Trace Length Buffer"),
+            size: (MAX_TYPES * MAX_TYPES * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create trace timer buffer (u32 per particle)
+        let trace_timer_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Trace Timer Buffer"),
+            size: (max_particles * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create trace previous position buffer (vec3 per particle)
+        let trace_prev_pos_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Trace Prev Position Buffer"),
+            size: (max_particles * std::mem::size_of::<[f32; 3]>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -279,7 +364,9 @@ impl ComputePipeline {
             size: (max_particles as u64)
                 * (trail_len as u64)
                 * (std::mem::size_of::<TrailPoint>() as u64),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -354,7 +441,7 @@ impl ComputePipeline {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: particle_buf.as_entire_binding(),
+                    resource: particle_buffers[0].as_entire_binding(), // Will be updated dynamically
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -367,46 +454,117 @@ impl ComputePipeline {
             ],
         });
 
-        // Create bind group
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: particle_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: rules_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: selection_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: selection_params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: reaction_buf.as_entire_binding(),
-                },
-            ],
-        });
+        // Create two compute bind groups for ping-pong
+        let compute_bind_groups = [
+            // Bind group 0: reads from buffer[0], writes to buffer[1]
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute Bind Group 0"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: particle_buffers[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: rules_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: selection_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: selection_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: reaction_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: trace_len_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: trace_timer_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: trace_prev_pos_buf.as_entire_binding(),
+                    },
+                ],
+            }),
+            // Bind group 1: reads from buffer[1], writes to buffer[0]
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute Bind Group 1"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: particle_buffers[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: rules_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: selection_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: selection_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: reaction_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: trace_len_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: trace_timer_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: trace_prev_pos_buf.as_entire_binding(),
+                    },
+                ],
+            }),
+        ];
 
         Self {
             pipeline,
             bind_group_layout,
-            bind_group,
-            particle_buf,
+            compute_bind_groups,
+            particle_buffers,
+            particle_read_index: 0,
+            particle_write_index: 1,
             params_buf,
             rules_buf,
             reaction_buf,
+            trace_len_buf,
+            trace_timer_buf,
+            trace_prev_pos_buf,
             selection_buf,
             selection_params_buf,
             readback_buf,
@@ -424,6 +582,21 @@ impl ComputePipeline {
         }
     }
 
+    pub fn current_render_particle_buffer(&self) -> &wgpu::Buffer {
+        &self.particle_buffers[self.particle_read_index]
+    }
+
+    pub fn current_compute_bind_group(&self) -> &wgpu::BindGroup {
+        &self.compute_bind_groups[self.particle_read_index]
+    }
+
+    pub fn swap_particle_buffers(&mut self) {
+        std::mem::swap(
+            &mut self.particle_read_index,
+            &mut self.particle_write_index,
+        );
+    }
+
     pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, particle_count: u32) {
         let workgroups = (particle_count + 63) / 64; // 64 threads per workgroup
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -431,13 +604,26 @@ impl ComputePipeline {
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.pipeline);
-        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.set_bind_group(0, self.current_compute_bind_group(), &[]);
         cpass.dispatch_workgroups(workgroups, 1, 1);
     }
 
     pub fn upload_particles(&mut self, queue: &wgpu::Queue, particles: &[GpuParticle]) {
-        queue.write_buffer(&self.particle_buf, 0, bytemuck::cast_slice(particles));
+        // Write to both particle buffers to avoid stale data
+        queue.write_buffer(
+            &self.particle_buffers[0],
+            0,
+            bytemuck::cast_slice(particles),
+        );
+        queue.write_buffer(
+            &self.particle_buffers[1],
+            0,
+            bytemuck::cast_slice(particles),
+        );
         self.particle_count = particles.len() as u32;
+        // Reset indices after upload
+        self.particle_read_index = 0;
+        self.particle_write_index = 1;
     }
 
     pub fn upload_params(&self, queue: &wgpu::Queue, params: &GpuParams) {
@@ -463,6 +649,25 @@ impl ComputePipeline {
         queue.write_buffer(&self.reaction_buf, 0, bytemuck::cast_slice(table));
     }
 
+    pub fn upload_trace_lengths(&self, queue: &wgpu::Queue, trace_len_matrix: &[u32]) {
+        let max_bytes = MAX_TYPES * MAX_TYPES * std::mem::size_of::<u32>();
+        let upload_bytes = std::mem::size_of_val(trace_len_matrix);
+
+        assert!(
+            upload_bytes <= max_bytes,
+            "trace_len_matrix buffer overflow: trying to upload {} bytes, capacity {} bytes ({} types)",
+            upload_bytes,
+            max_bytes,
+            MAX_TYPES
+        );
+
+        queue.write_buffer(
+            &self.trace_len_buf,
+            0,
+            bytemuck::cast_slice(trace_len_matrix),
+        );
+    }
+
     pub fn upload_selection_params(&self, queue: &wgpu::Queue, params: &SelectionParams) {
         queue.write_buffer(&self.selection_params_buf, 0, bytemuck::bytes_of(params));
     }
@@ -474,7 +679,12 @@ impl ComputePipeline {
     }
 
     /// Read back selection flags and convert to selected_indices
-    pub fn readback_selection(&self, device: &wgpu::Device, queue: &wgpu::Queue, particle_count: u32) -> Result<Vec<usize>, wgpu::BufferAsyncError> {
+    pub fn readback_selection(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        particle_count: u32,
+    ) -> Result<Vec<usize>, wgpu::BufferAsyncError> {
         if particle_count == 0 {
             return Ok(Vec::new());
         }
@@ -512,14 +722,14 @@ impl ComputePipeline {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        
+
         // Wait for the mapping to complete
         rx.recv().unwrap()?;
-        
+
         // Read the selection data
         let selection_data = buffer_slice.get_mapped_range();
         let selection_flags: &[u32] = bytemuck::cast_slice(&selection_data);
-        
+
         // Convert selection flags to indices
         let mut selected_indices = Vec::new();
         for (i, &flag) in selection_flags.iter().enumerate() {
@@ -581,9 +791,8 @@ impl ComputePipeline {
     }
 
     pub fn clear_trail_history(&self, encoder: &mut wgpu::CommandEncoder, max_particles: usize) {
-        let size = (max_particles
-            * (self.trail_len as usize)
-            * std::mem::size_of::<TrailPoint>()) as u64;
+        let size =
+            (max_particles * (self.trail_len as usize) * std::mem::size_of::<TrailPoint>()) as u64;
 
         // Use efficient buffer clearing instead of allocating a huge zero Vec
         encoder.clear_buffer(&self.trail_history_buf, 0, Some(size));

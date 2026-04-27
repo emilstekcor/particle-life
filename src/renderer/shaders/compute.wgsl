@@ -38,12 +38,16 @@ struct SelectionParams {
     _pad1: f32,
 };
 
-@group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
-@group(0) @binding(1) var<uniform>             params:    Params;
-@group(0) @binding(2) var<storage, read>       rules:     array<f32>;
-@group(0) @binding(3) var<storage, read_write> selection: array<u32>;
-@group(0) @binding(4) var<uniform>             sel_params: SelectionParams;
-@group(0) @binding(5) var<storage, read>       reaction_table: array<i32>;
+@group(0) @binding(0) var<storage, read>  particles_in:  array<Particle>;
+@group(0) @binding(1) var<storage, read_write> particles_out: array<Particle>;
+@group(0) @binding(2) var<uniform>             params:    Params;
+@group(0) @binding(3) var<storage, read>       rules:     array<f32>;
+@group(0) @binding(4) var<storage, read_write> selection: array<u32>;
+@group(0) @binding(5) var<uniform>             sel_params: SelectionParams;
+@group(0) @binding(6) var<storage, read>       reaction_table: array<i32>;
+@group(0) @binding(7) var<storage, read>       trace_len_matrix: array<u32>;
+@group(0) @binding(8) var<storage, read_write> trace_timers: array<u32>;
+@group(0) @binding(9) var<storage, read_write> trace_prev_pos: array<vec3<f32>>;
 
 fn wrap_delta(d: f32, bounds: f32) -> f32 {
     let half = bounds * 0.5;
@@ -84,13 +88,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= params.count { return; }
 
-    let pi   = particles[i];
+    let pi   = particles_in[i];
+    let old_pos = pi.position; // Store old position for trace
     let r2   = params.r_max * params.r_max;
     var f    = vec3<f32>(0.0);
 
     for (var j = 0u; j < params.count; j++) {
         if j == i { continue; }
-        let pj = particles[j];
+        let pj = particles_in[j];
 
         var d = pj.position - pi.position;
         if params.wrap != 0u {
@@ -126,16 +131,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Reactions
+    var final_kind = particles_in[i].kind;
     if params.reactions_enabled != 0u {
         let mix_r_sq = params.mix_radius * params.mix_radius;
-        let ri = particles[i].kind;
 
         for (var j = 0u; j < params.count; j++) {
             if j == i { continue; }
 
-            var dx = particles[j].position.x - pos.x;
-            var dy = particles[j].position.y - pos.y;
-            var dz = particles[j].position.z - pos.z;
+            var dx = particles_in[j].position.x - pos.x;
+            var dy = particles_in[j].position.y - pos.y;
+            var dz = particles_in[j].position.z - pos.z;
 
             if params.wrap != 0u {
                 let half = params.bounds * 0.5;
@@ -150,24 +155,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let dist_sq = dx*dx + dy*dy + dz*dz;
             if dist_sq > mix_r_sq { continue; }
 
-            let rj = particles[j].kind;
+            let ri = particles_in[i].kind;
+            let rj = particles_in[j].kind;
             let result = reaction_table[ri * params.type_count + rj];
             if result >= 0 {
                 // Use a deterministic per-pair hash as a cheap "random" gate
                 let hash = (i * 2654435761u + j * 2246822519u + u32(params.dt * 1000.0)) & 0xFFFFu;
                 let threshold = u32(params.reaction_probability * 65535.0);
                 if hash < threshold {
-                    particles[i].kind = u32(result);
+                    final_kind = u32(result);
+                    
+                    // Set trace timer based on trace length matrix
+                    let trace_idx = ri * params.type_count + rj;
+                    let trace_life = trace_len_matrix[trace_idx];
+                    if trace_life > 0u {
+                        trace_timers[i] = trace_life;
+                        trace_prev_pos[i] = old_pos;
+                    }
                 }
             }
         }
     }
 
     // Write back
-    particles[i].velocity = vel;
-    particles[i].position = pos;
+    particles_out[i] = Particle(
+        pos,
+        final_kind,
+        vel,
+        pi.prefab_id
+    );
     
     // Update selection
     let is_selected = check_selection(pos, sel_params);
-    selection[i] = select(0u, 1u, is_selected);
+    selection[i] = u32(is_selected);
+    
+    // Decrement trace timer
+    if trace_timers[i] > 0u {
+        trace_timers[i] = trace_timers[i] - 1u;
+    }
 }
