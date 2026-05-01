@@ -270,12 +270,12 @@ impl DrawPipeline {
             layout: Some(&trail_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &trail_shader,
-                entry_point: "vs_main",
+                entry_point: "vs_point",
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &trail_shader,
-                entry_point: "fs_main",
+                entry_point: "fs_point",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_cfg.format,
                     blend: Some(wgpu::BlendState {

@@ -1,5 +1,9 @@
 use serde::Serialize;
-use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{sim::SimState, ui::UiState};
 

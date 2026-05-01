@@ -3,7 +3,7 @@
 //! Screen-space queries for rectangle, brush, and depth-slice selection modes.
 
 use crate::sim::SimState;
-use glam::{Vec3, Mat4, Vec4Swizzles};
+use glam::{Mat4, Vec3, Vec4Swizzles};
 
 /// Query particles within a screen-space rectangle
 pub fn query_particles_in_rect(
@@ -12,7 +12,9 @@ pub fn query_particles_in_rect(
     viewport: [u32; 2],
     rect: egui::Rect,
 ) -> Vec<usize> {
-    sim.particles.iter().enumerate()
+    sim.particles
+        .iter()
+        .enumerate()
         .filter_map(|(i, p)| {
             let sp = world_to_screen(view_proj, Vec3::from(p.position), viewport)?;
             rect.contains(sp).then_some(i)
@@ -29,7 +31,9 @@ pub fn query_particles_in_brush(
     brush_radius: f32,
 ) -> Vec<usize> {
     let r2 = brush_radius * brush_radius;
-    sim.particles.iter().enumerate()
+    sim.particles
+        .iter()
+        .enumerate()
         .filter_map(|(i, p)| {
             let sp = world_to_screen(view_proj, Vec3::from(p.position), viewport)?;
             let d2 = (sp.x - brush_center.x).powi(2) + (sp.y - brush_center.y).powi(2);
@@ -49,7 +53,9 @@ pub fn query_particles_in_slice(
     let min_d = slice_center - half;
     let max_d = slice_center + half;
 
-    sim.particles.iter().enumerate()
+    sim.particles
+        .iter()
+        .enumerate()
         .filter_map(|(i, p)| {
             let vp = view_matrix * Vec3::from(p.position).extend(1.0);
             (vp.z >= min_d && vp.z <= max_d).then_some(i)
@@ -86,9 +92,9 @@ pub fn nearest_particle_in_screen_radius(
 
 /// Get camera-plane right/up/forward axes from a view matrix
 pub fn camera_plane_axes(view_matrix: glam::Mat4) -> (glam::Vec3, glam::Vec3, glam::Vec3) {
-    let inv     = view_matrix.inverse();
-    let right   =  inv.x_axis.truncate().normalize();
-    let up      =  inv.y_axis.truncate().normalize();
+    let inv = view_matrix.inverse();
+    let right = inv.x_axis.truncate().normalize();
+    let up = inv.y_axis.truncate().normalize();
     let forward = -inv.z_axis.truncate().normalize();
     (right, up, forward)
 }
@@ -96,7 +102,9 @@ pub fn camera_plane_axes(view_matrix: glam::Mat4) -> (glam::Vec3, glam::Vec3, gl
 /// Convert world position to egui screen coordinates
 fn world_to_screen(view_proj: Mat4, pos: Vec3, viewport: [u32; 2]) -> Option<egui::Pos2> {
     let clip = view_proj * pos.extend(1.0);
-    if clip.w <= 0.0 { return None; }
+    if clip.w <= 0.0 {
+        return None;
+    }
     let ndc = clip.xyz() / clip.w;
     Some(egui::pos2(
         (ndc.x * 0.5 + 0.5) * viewport[0] as f32,

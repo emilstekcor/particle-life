@@ -27,29 +27,19 @@ pub struct GpuParams {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SelectionParams {
-    pub mode: u32,
-    pub _pad0: [u32; 3], // align to 16 bytes
-
-    pub rect_min: [f32; 2],
-    pub _pad1: [f32; 2],
-
-    pub rect_max: [f32; 2],
-    pub _pad2: [f32; 2],
-
-    pub brush_center: [f32; 2],
-    pub _pad3: [f32; 2],
-
-    pub brush_radius: f32,
-    pub slice_depth: f32,
-    pub _pad4: [f32; 2],
+    pub mode_flags: [u32; 4],     // mode + 3 flags/padding
+    
+    pub rect_min: [f32; 4],       // rect_min + padding
+    pub rect_max: [f32; 4],       // rect_max + padding
+    
+    pub brush_data: [f32; 4],     // brush_center.x, brush_center.y, brush_radius, slice_depth
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TrailPoint {
-    pub position: [f32; 3],
-    pub kind: u32,
-    pub _pad: u32,
+    pub pos_radius: [f32; 4],    // xyz + radius/type/etc
+    pub color_timer: [u32; 4],  // color + timer data
 }
 
 #[repr(C)]
@@ -61,8 +51,8 @@ pub struct TrailParams {
     pub valid_len: u32,
     pub enabled: u32,
     pub type_filter: i32,
+    pub trigger_only: u32,
     pub _pad0: u32,
-    pub _pad1: u32,
 }
 
 impl From<&SimParams> for GpuParams {
@@ -357,7 +347,8 @@ impl ComputePipeline {
         });
 
         // Create trail buffers
-        const DEFAULT_TRAIL_LEN: u32 = 16;
+        // Keep default within GPU buffer limits (safe for large particle counts)
+        const DEFAULT_TRAIL_LEN: u32 = 20;
         let trail_len = DEFAULT_TRAIL_LEN;
         let trail_history_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Trail History Buffer"),
@@ -417,6 +408,16 @@ impl ComputePipeline {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -450,6 +451,10 @@ impl ComputePipeline {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: trail_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: trace_timer_buf.as_entire_binding(),
                 },
             ],
         });
@@ -746,7 +751,7 @@ impl ComputePipeline {
         Ok(selected_indices)
     }
 
-    pub fn upload_trail_params(&self, queue: &wgpu::Queue) {
+    pub fn upload_trail_params(&self, queue: &wgpu::Queue, trigger_only: bool) {
         let params = TrailParams {
             particle_count: self.particle_count,
             trail_len: self.trail_len,
@@ -754,10 +759,35 @@ impl ComputePipeline {
             valid_len: self.trail_valid_len,
             enabled: self.trails_enabled as u32,
             type_filter: self.trail_type_filter,
+            trigger_only: if trigger_only { 1 } else { 0 },
             _pad0: 0,
-            _pad1: 0,
         };
         queue.write_buffer(&self.trail_params_buf, 0, bytemuck::bytes_of(&params));
+    }
+
+    pub fn update_trail_capture_bind_group(&mut self, device: &wgpu::Device) {
+        self.trail_capture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Trail Capture Bind Group"),
+            layout: &self.trail_capture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.particle_buffers[self.particle_read_index].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.trail_history_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.trail_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.trace_timer_buf.as_entire_binding(),
+                },
+            ],
+        });
     }
 
     pub fn dispatch_trail_capture(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -788,6 +818,11 @@ impl ComputePipeline {
     pub fn reset_trails(&mut self) {
         self.trail_head = 0;
         self.trail_valid_len = 0;
+    }
+
+    pub fn clear_trace_timers(&self, encoder: &mut wgpu::CommandEncoder, max_particles: usize) {
+        let size = (max_particles * std::mem::size_of::<u32>()) as u64;
+        encoder.clear_buffer(&self.trace_timer_buf, 0, Some(size));
     }
 
     pub fn clear_trail_history(&self, encoder: &mut wgpu::CommandEncoder, max_particles: usize) {

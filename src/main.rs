@@ -1,8 +1,8 @@
-mod sim;
-mod ui;
+mod crash_profile;
 mod renderer;
 mod selection;
-mod crash_profile;
+mod sim;
+mod ui;
 
 use winit::{
     event::{Event, WindowEvent},
@@ -10,12 +10,22 @@ use winit::{
     window::WindowBuilder,
 };
 
-use sim::SimState;
 use renderer::Renderer;
+use sim::SimState;
 use ui::UiState;
 
 fn main() {
     env_logger::init();
+    
+    // Debug: Print struct sizes to verify alignment
+    println!("=== STRUCT SIZE VERIFICATION ===");
+    println!("SelectionParams: {} bytes", std::mem::size_of::<renderer::compute::SelectionParams>());
+    println!("TrailPoint: {} bytes", std::mem::size_of::<renderer::compute::TrailPoint>());
+    println!("Particle: {} bytes", std::mem::size_of::<sim::Particle>());
+    println!("GpuParticle: {} bytes", std::mem::size_of::<sim::GpuParticle>());
+    println!("GpuParams: {} bytes", std::mem::size_of::<renderer::compute::GpuParams>());
+    println!("TrailParams: {} bytes", std::mem::size_of::<renderer::compute::TrailParams>());
+    println!("================================");
 
     // Set up panic hook to show crash profile location on panic
     std::panic::set_hook(Box::new(|info| {
@@ -44,81 +54,81 @@ fn main() {
         .unwrap_or_else(|| std::env::current_dir().unwrap())
         .join("particle_life")
         .join("book.json");
-    
+
     // Create directory if it doesn't exist
     if let Some(parent) = book_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    
+
     sim.book.load_from_file(&book_path.to_string_lossy());
 
-    event_loop.run(move |event, target| {
-        // Pass window events to egui first
-        let egui_resp = renderer.egui_handle_event(&window, &event);
-        if egui_resp.repaint { 
-            window.request_redraw(); 
-        }
+    event_loop
+        .run(move |event, target| {
+            // Pass window events to egui first
+            let egui_resp = renderer.egui_handle_event(&window, &event);
+            if egui_resp.repaint {
+                window.request_redraw();
+            }
 
-        match event {
-            Event::WindowEvent { event: ref win_event, .. } => {
-                match win_event {
-                    WindowEvent::CloseRequested => target.exit(),
+            match event {
+                Event::WindowEvent {
+                    event: ref win_event,
+                    ..
+                } => {
+                    match win_event {
+                        WindowEvent::CloseRequested => target.exit(),
 
-                    WindowEvent::Resized(size) => {
-                        renderer.resize(*size);
-                    }
+                        WindowEvent::Resized(size) => {
+                            renderer.resize(*size);
+                        }
 
-                    WindowEvent::RedrawRequested => {
-                        // Physics stepping control
-                        let should_step = if ui.paused {
-                            std::mem::take(&mut ui.step_once)
-                        } else {
-                            true
-                        };
-
-                        if should_step {
-                            if ui.use_gpu_physics {
-                                // GPU physics is handled in the renderer
-                                // step_count will be incremented there
+                        WindowEvent::RedrawRequested => {
+                            // Physics stepping control
+                            let should_step = if ui.paused {
+                                std::mem::take(&mut ui.step_once)
                             } else {
-                                // CPU physics
-                                sim.step();
-                                sim.particles_dirty = true;
+                                true
+                            };
+
+                            if should_step {
+                                if ui.use_gpu_physics {
+                                    // GPU physics is handled in the renderer
+                                    // step_count will be incremented there
+                                } else {
+                                    // CPU physics
+                                    sim.step();
+                                    sim.particles_dirty = true;
+                                }
                             }
+
+                            // TEMP DISABLED: GPU readback stalls the frame hard.
+                            // Only re-enable when selection actually needs CPU-side selected_indices.
+                            // if ui.selection_readback_needed && !ui.is_selecting {
+                            //     renderer.sync_selection(&mut ui);
+                            // }
+
+                            renderer.render(&window, &mut sim, &mut ui);
+
+                            // Flush book saving if dirty (deferred I/O to avoid blocking UI)
+                            sim.book.flush_if_dirty();
                         }
 
-                        // TEMP DISABLED: GPU readback stalls the frame hard.
-                        // Only re-enable when selection actually needs CPU-side selected_indices.
-                        // if ui.selection_readback_needed && !ui.is_selecting {
-                        //     renderer.sync_selection(&mut ui);
-                        // }
-                        
-                        renderer.render(&window, &mut sim, &mut ui);
-                        
-                        // Only save crash profile every 500 steps to avoid blocking I/O stalls
-                        if sim.step_count % 500 == 0 {
-                            crash_profile::save_crash_profile(&sim, &ui);
-                        }
-                        
-                        // Flush book saving if dirty (deferred I/O to avoid blocking UI)
-                        sim.book.flush_if_dirty();
+                        _ => {}
                     }
-
-                    _ => {}
                 }
-            }
 
-            Event::AboutToWait => {
-                let animating = !ui.paused || ui.step_once || ui.camera_mode;
-                if animating {
-                    target.set_control_flow(ControlFlow::Poll);
-                    window.request_redraw();
-                } else {
-                    target.set_control_flow(ControlFlow::Wait);
+                Event::AboutToWait => {
+                    let animating = !ui.paused || ui.step_once || ui.camera_mode;
+                    if animating {
+                        target.set_control_flow(ControlFlow::Poll);
+                        window.request_redraw();
+                    } else {
+                        target.set_control_flow(ControlFlow::Wait);
+                    }
                 }
-            }
 
-            _ => {}
-        }
-    }).unwrap();
+                _ => {}
+            }
+        })
+        .unwrap();
 }

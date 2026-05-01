@@ -25,17 +25,12 @@ struct Params {
 };
 
 struct SelectionParams {
-    mode: u32,
-    _pad0: vec3<u32>,
-
-    rect_min: vec2<f32>,
-    rect_max: vec2<f32>,
-
-    brush_center: vec2<f32>,
-    brush_radius: f32,
-
-    slice_depth: f32,
-    _pad1: f32,
+    mode_flags: vec4<u32>,      // mode + 3 flags/padding
+    
+    rect_min: vec4<f32>,        // rect_min + padding
+    rect_max: vec4<f32>,        // rect_max + padding
+    
+    brush_data: vec4<f32>,      // brush_center.x, brush_center.y, brush_radius, slice_depth
 };
 
 @group(0) @binding(0) var<storage, read>  particles_in:  array<Particle>;
@@ -64,20 +59,20 @@ fn force_law(dn: f32, attr: f32, beta: f32) -> f32 {
 }
 
 fn check_selection(pos: vec3<f32>, sel: SelectionParams) -> bool {
-    if sel.mode == 0u {
+    if sel.mode_flags[0] == 0u {
         return false;
     }
     
-    if sel.mode == 1u { // Rectangle selection
+    if sel.mode_flags[0] == 1u { // Rectangle selection
         let screen_pos = pos.xy;
         return screen_pos.x >= sel.rect_min.x && screen_pos.x <= sel.rect_max.x &&
                screen_pos.y >= sel.rect_min.y && screen_pos.y <= sel.rect_max.y;
-    } else if sel.mode == 2u { // Brush selection
+    } else if sel.mode_flags[0] == 2u { // Brush selection
         let screen_pos = pos.xy;
-        let dist = distance(screen_pos, sel.brush_center);
-        return dist <= sel.brush_radius;
-    } else if sel.mode == 3u { // Slice selection
-        return pos.z <= sel.slice_depth;
+        let dist = distance(screen_pos, sel.brush_data.xy);
+        return dist <= sel.brush_data[2];
+    } else if sel.mode_flags[0] == 3u { // Slice selection
+        return pos.z <= sel.brush_data[3];
     }
     
     return false;
@@ -169,8 +164,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let trace_idx = ri * params.type_count + rj;
                     let trace_life = trace_len_matrix[trace_idx];
                     if trace_life > 0u {
-                        trace_timers[i] = trace_life;
+                        trace_timers[i] = max(trace_timers[i], trace_life);
+                        trace_timers[j] = max(trace_timers[j], trace_life);
+
                         trace_prev_pos[i] = old_pos;
+                        trace_prev_pos[j] = particles_in[j].position;
                     }
                 }
             }

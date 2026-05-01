@@ -1,6 +1,6 @@
 use crate::sim::{CpuStepMode, SimState};
-use std::time::Instant;
 use rand::Rng;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolvedStepMode {
@@ -62,7 +62,10 @@ fn resolve_step_mode(state: &SimState, count: usize) -> ResolvedStepMode {
         CpuStepMode::Naive => ResolvedStepMode::Naive,
         CpuStepMode::GridExact => ResolvedStepMode::GridExact,
         CpuStepMode::Auto => {
-            if count >= state.params.auto_grid_threshold && state.params.r_max > 0.0 && state.params.bounds > 0.0 {
+            if count >= state.params.auto_grid_threshold
+                && state.params.r_max > 0.0
+                && state.params.bounds > 0.0
+            {
                 ResolvedStepMode::GridExact
             } else {
                 ResolvedStepMode::Naive
@@ -163,7 +166,7 @@ fn cpu_step_naive(state: &mut SimState) -> StepStats {
     let dt = state.params.dt;
     let wrap = state.params.wrap;
     let bounds = state.params.bounds;
-    
+
     for (i, p) in state.particles.iter_mut().enumerate() {
         p.velocity = state.vel_scratch[i];
         p.position[0] += p.velocity[0] * dt;
@@ -205,7 +208,7 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
 
     let grid_res = choose_grid_res(bounds, r_max);
     let total_cells = grid_res * grid_res * grid_res;
-    
+
     // Prepare buckets scratch buffer
     state.buckets_scratch.resize_with(total_cells, Vec::new);
     for b in &mut state.buckets_scratch {
@@ -235,11 +238,17 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
         let mut fz = 0.0_f32;
 
         for ox in -1isize..=1 {
-            let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else { continue; };
+            let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else {
+                continue;
+            };
             for oy in -1isize..=1 {
-                let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else { continue; };
+                let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else {
+                    continue;
+                };
                 for oz in -1isize..=1 {
-                    let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else { continue; };
+                    let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else {
+                        continue;
+                    };
 
                     let nid = cell_index(nx, ny, nz, grid_res);
                     for &j in &state.buckets_scratch[nid] {
@@ -302,7 +311,7 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
     let dt = state.params.dt;
     let wrap = state.params.wrap;
     let bounds = state.params.bounds;
-    
+
     for (i, p) in state.particles.iter_mut().enumerate() {
         p.velocity = state.vel_scratch[i];
         p.position[0] += p.velocity[0] * dt;
@@ -322,7 +331,6 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
         grid_res,
     }
 }
-
 
 fn clamp_velocity(vel: &mut [f32; 3], max_speed: f32) {
     let speed_sq = vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2];
@@ -407,7 +415,9 @@ pub fn apply_reactions(state: &mut SimState) {
     let bounds = state.params.bounds;
     let wrap = state.params.wrap;
     let count = state.particles.len();
-    if count == 0 { return; }
+    if count == 0 {
+        return;
+    }
 
     let mut rng = rand::thread_rng();
     state.reaction_changes_scratch.clear();
@@ -425,37 +435,51 @@ pub fn apply_reactions(state: &mut SimState) {
             let [cx, cy, cz] = cell_coords(pi_pos, bounds, grid_res, wrap);
 
             for ox in -1isize..=1 {
-                let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else { continue };
+                let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else {
+                    continue;
+                };
                 for oy in -1isize..=1 {
-                    let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else { continue };
+                    let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else {
+                        continue;
+                    };
                     for oz in -1isize..=1 {
-                        let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else { continue };
+                        let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else {
+                            continue;
+                        };
                         let nid = cell_index(nx, ny, nz, grid_res);
                         if nid < state.buckets_scratch.len() {
                             for &j in &state.buckets_scratch[nid] {
-                                if j <= i { continue; } // each pair once
+                                if j <= i {
+                                    continue;
+                                } // each pair once
 
-                            let pj = &state.particles[j];
-                            let mut dx = pj.position[0] - pi_pos[0];
-                            let mut dy = pj.position[1] - pi_pos[1];
-                            let mut dz = pj.position[2] - pi_pos[2];
-                            if wrap {
-                                dx = wrap_delta(dx, bounds);
-                                dy = wrap_delta(dy, bounds);
-                                dz = wrap_delta(dz, bounds);
-                            }
-                            let dist_sq = dx*dx + dy*dy + dz*dz;
-                            if dist_sq > mix_r_sq { continue; }
+                                let pj = &state.particles[j];
+                                let mut dx = pj.position[0] - pi_pos[0];
+                                let mut dy = pj.position[1] - pi_pos[1];
+                                let mut dz = pj.position[2] - pi_pos[2];
+                                if wrap {
+                                    dx = wrap_delta(dx, bounds);
+                                    dy = wrap_delta(dy, bounds);
+                                    dz = wrap_delta(dz, bounds);
+                                }
+                                let dist_sq = dx * dx + dy * dy + dz * dz;
+                                if dist_sq > mix_r_sq {
+                                    continue;
+                                }
 
-                            let rj = pj.kind as usize;
-                            let result_ij = state.reaction_table[ri * n + rj];
-                            let result_ji = state.reaction_table[rj * n + ri];
-                            if result_ij >= 0 && rng.gen::<f32>() < prob {
-                                state.reaction_changes_scratch.push((i, result_ij as u32));
-                            }
-                            if result_ji >= 0 && rng.gen::<f32>() < prob {
-                                state.reaction_changes_scratch.push((j, result_ji as u32));
-                            }
+                                let rj = pj.kind as usize;
+                                // Bounds check to prevent index out of bounds
+                                if ri >= n || rj >= n {
+                                    continue;
+                                }
+                                let result_ij = state.reaction_table[ri * n + rj];
+                                let result_ji = state.reaction_table[rj * n + ri];
+                                if result_ij >= 0 && rng.gen::<f32>() < prob {
+                                    state.reaction_changes_scratch.push((i, result_ij as u32));
+                                }
+                                if result_ji >= 0 && rng.gen::<f32>() < prob {
+                                    state.reaction_changes_scratch.push((j, result_ji as u32));
+                                }
                             }
                         }
                     }
@@ -465,21 +489,35 @@ pub fn apply_reactions(state: &mut SimState) {
     } else {
         // Naive fallback (small N)
         for i in 0..count {
-            for j in (i+1)..count {
+            for j in (i + 1)..count {
                 let pi = &state.particles[i];
                 let pj = &state.particles[j];
                 let mut dx = pj.position[0] - pi.position[0];
                 let mut dy = pj.position[1] - pi.position[1];
                 let mut dz = pj.position[2] - pi.position[2];
-                if wrap { dx = wrap_delta(dx, bounds); dy = wrap_delta(dy, bounds); dz = wrap_delta(dz, bounds); }
-                let dist_sq = dx*dx + dy*dy + dz*dz;
-                if dist_sq > mix_r_sq { continue; }
+                if wrap {
+                    dx = wrap_delta(dx, bounds);
+                    dy = wrap_delta(dy, bounds);
+                    dz = wrap_delta(dz, bounds);
+                }
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                if dist_sq > mix_r_sq {
+                    continue;
+                }
                 let ri = pi.kind as usize;
                 let rj = pj.kind as usize;
+                // Bounds check to prevent index out of bounds
+                if ri >= n || rj >= n {
+                    continue;
+                }
                 let result_ij = state.reaction_table[ri * n + rj];
                 let result_ji = state.reaction_table[rj * n + ri];
-                if result_ij >= 0 && rng.gen::<f32>() < prob { state.reaction_changes_scratch.push((i, result_ij as u32)); }
-                if result_ji >= 0 && rng.gen::<f32>() < prob { state.reaction_changes_scratch.push((j, result_ji as u32)); }
+                if result_ij >= 0 && rng.gen::<f32>() < prob {
+                    state.reaction_changes_scratch.push((i, result_ij as u32));
+                }
+                if result_ji >= 0 && rng.gen::<f32>() < prob {
+                    state.reaction_changes_scratch.push((j, result_ji as u32));
+                }
             }
         }
     }

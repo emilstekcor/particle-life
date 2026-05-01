@@ -310,7 +310,9 @@ impl Renderer {
 
         // 3) Sync UI state into compute trail parameters
         // Clear trail history when enabling trails mid-sim to avoid garbage
-        let trails_enabled = ui.trace_render_mode != crate::ui::TraceRenderMode::Off;
+        let trails_enabled =
+            ui.trace_render_mode != crate::ui::TraceRenderMode::Off
+            && !ui.trace_ui_edit_only;
         let trails_newly_enabled = trails_enabled && !self.compute.trails_enabled;
         if trails_newly_enabled {
             self.compute.reset_trails();
@@ -320,14 +322,14 @@ impl Renderer {
 
         self.compute.trails_enabled = trails_enabled;
         let trail_len_changed = ui.trace_len != self.compute.trail_len;
-        self.compute.trail_len = ui.trace_len.clamp(1, 16);
+        self.compute.trail_len = ui.trace_len.clamp(1, 20);
         if trail_len_changed {
             self.compute.reset_trails();
             self.compute
                 .clear_trail_history(&mut encoder, crate::sim::MAX_RENDER_PARTICLES);
         }
         self.compute.trail_type_filter = ui.trace_type_filter;
-        self.compute.upload_trail_params(&self.queue);
+        self.compute.upload_trail_params(&self.queue, ui.trace_trigger_only);
 
         // 4) GPU step - only when GPU physics is enabled
         if ui.use_gpu_physics && (!ui.paused || ui.step_once) {
@@ -336,6 +338,9 @@ impl Renderer {
 
             // Swap ping-pong buffers after compute completes
             self.compute.swap_particle_buffers();
+            
+            // Update trail capture bind group to use the current particle buffer
+            self.compute.update_trail_capture_bind_group(&self.device);
 
             // Only run complex trail capture for Lines/Dots modes, not Simple mode
             if matches!(
@@ -344,7 +349,7 @@ impl Renderer {
             ) {
                 self.compute.dispatch_trail_capture(&mut encoder);
                 self.compute.advance_trail_head();
-                self.compute.upload_trail_params(&self.queue);
+                self.compute.upload_trail_params(&self.queue, ui.trace_trigger_only);
             }
 
             sim.step_count += 1;

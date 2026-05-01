@@ -15,8 +15,9 @@ struct CameraUniform {
 };
 
 struct TrailPoint {
-    pos_radius: vec4<f32>,    // xyz + radius/type/etc
-    color_timer: vec4<u32>,  // color + timer data
+    position: vec3<f32>,
+    kind: u32,
+    _pad: u32,  // Rust TrailPoint = { [f32;3], u32, u32 } = 20 bytes
 };
 
 // Must match Rust TrailParams exactly (8 × u32 = 32 bytes)
@@ -103,19 +104,19 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     let point = trail_history[idx];
 
     // Inactive/filtered particles write sentinel position 999999
-    if (point.pos_radius.x > 900000.0) {
+    if (point.position.x > 900000.0) {
         return make_degenerate();
     }
-    if (trail.type_filter >= 0 && i32(point.color_timer[0]) != trail.type_filter) {
+    if (trail.type_filter >= 0 && i32(point.kind) != trail.type_filter) {
         return make_degenerate();
     }
 
     var out: VsOut;
-    out.pos = camera.view_proj * vec4<f32>(point.pos_radius.xyz, 1.0);
+    out.pos = camera.view_proj * vec4<f32>(point.position, 1.0);
 
     // age_t: 0 = oldest segment, 1 = newest segment
     let age_t = f32(segment_id + 1u) / f32(valid_segments);
-    let base  = type_color(point.color_timer[0]);
+    let base  = type_color(point.kind);
     let alpha = 0.05 + 0.60 * age_t;
     out.color = vec4<f32>(base * (0.3 + 0.7 * age_t), alpha);
 
@@ -154,19 +155,19 @@ fn vs_point(@builtin(vertex_index) vid: u32) -> VsOut {
 
     let point = trail_history[idx];
 
-    if (point.pos_radius.x > 900000.0) {
+    if (point.position.x > 900000.0) {
         return make_degenerate();
     }
-    if (trail.type_filter >= 0 && i32(point.color_timer[0]) != trail.type_filter) {
+    if (trail.type_filter >= 0 && i32(point.kind) != trail.type_filter) {
         return make_degenerate();
     }
 
     var out: VsOut;
-    out.pos = camera.view_proj * vec4<f32>(point.pos_radius.xyz, 1.0);
+    out.pos = camera.view_proj * vec4<f32>(point.position, 1.0);
 
     // age_t: 0 = oldest, 1 = newest
     let age_t = (f32(sample_id) + 1.0) / f32(trail.valid_len);
-    let base  = type_color(point.color_timer[0]);
+    let base  = type_color(point.kind);
     let alpha = 0.08 + 0.55 * age_t;
     out.color = vec4<f32>(base * age_t, alpha);
 

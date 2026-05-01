@@ -59,15 +59,13 @@ impl Book {
     pub fn load_from_file(&mut self, path: &str) {
         self.path = path.to_string();
         match fs::read_to_string(path) {
-            Ok(contents) => {
-                match serde_json::from_str::<Vec<Prefab>>(&contents) {
-                    Ok(prefabs) => {
-                        self.prefabs = prefabs;
-                        log::info!("Loaded {} creature(s) from {}", self.prefabs.len(), path);
-                    }
-                    Err(e) => log::warn!("Failed to parse {}: {}", path, e),
+            Ok(contents) => match serde_json::from_str::<Vec<Prefab>>(&contents) {
+                Ok(prefabs) => {
+                    self.prefabs = prefabs;
+                    log::info!("Loaded {} creature(s) from {}", self.prefabs.len(), path);
                 }
-            }
+                Err(e) => log::warn!("Failed to parse {}: {}", path, e),
+            },
             Err(_) => {
                 // File doesn't exist yet — that's fine, we'll create it on first save
                 log::info!("No {} found, starting with empty book", path);

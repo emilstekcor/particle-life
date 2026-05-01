@@ -31,10 +31,10 @@ pub struct Particle {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuParticle {
-    pub position: [f32; 3],  // 12 bytes
-    pub kind: u32,           // 4 bytes -> 16 bytes total (vec3 alignment)
-    pub velocity: [f32; 3],  // 12 bytes
-    pub prefab_id: i32,       // 4 bytes -> 32 bytes total
+    pub position: [f32; 3], // 12 bytes
+    pub kind: u32,          // 4 bytes -> 16 bytes total (vec3 alignment)
+    pub velocity: [f32; 3], // 12 bytes
+    pub prefab_id: i32,     // 4 bytes -> 32 bytes total
 }
 
 impl GpuParticle {
@@ -56,6 +56,45 @@ impl Particle {
             velocity: [0.0; 3],
             prefab_id: -1,
             prefab_local_type: -1,
+        }
+    }
+}
+
+// ── RuntimeSimParams ────────────────────────────────────────────────────────
+/// Unified parameters used by both CPU and GPU physics
+/// Ensures identical behavior between CPU and GPU implementations
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RuntimeSimParams {
+    pub r_max: f32,
+    pub mix_radius: f32,
+    pub max_speed: f32,
+    pub force_scale: f32,
+    pub friction: f32,
+    pub dt: f32,
+    pub beta: f32,
+    pub bounds: f32,
+    pub wrap: u32,
+    pub reactions_enabled: u32,
+    pub reaction_probability: f32,
+    _pad: [u32; 2], // Align to 64 bytes total
+}
+
+impl RuntimeSimParams {
+    pub fn from_sim_params(params: &SimParams) -> Self {
+        Self {
+            r_max: params.r_max,
+            mix_radius: params.mix_radius,
+            max_speed: params.max_speed,
+            force_scale: params.force_scale,
+            friction: params.friction,
+            dt: params.dt,
+            beta: params.beta,
+            bounds: params.bounds,
+            wrap: params.wrap as u32,
+            reactions_enabled: params.reactions_enabled as u32,
+            reaction_probability: params.reaction_probability,
+            _pad: [0; 2],
         }
     }
 }
@@ -115,12 +154,12 @@ impl SimParams {
     pub fn scaled_r_max(&self) -> f32 {
         self.r_max * self.bounds / 20.0
     }
-    
+
     /// Get the actual mix_radius scaled by bounds
     pub fn scaled_mix_radius(&self) -> f32 {
         self.mix_radius * self.bounds / 20.0
     }
-    
+
     /// Get the actual max_speed scaled by bounds
     pub fn scaled_max_speed(&self) -> f32 {
         self.max_speed * self.bounds / 20.0
@@ -133,6 +172,9 @@ pub struct SimState {
     pub params: SimParams,
     pub force_matrix: Vec<f32>,
     pub reaction_table: Vec<i32>,
+    pub reaction_table_dirty: bool,
+    pub trace_len_matrix: Vec<u32>,
+    pub trace_len_matrix_dirty: bool,
     pub book: Book,
     pub step_count: u64,
     pub particles_dirty: bool,
@@ -162,6 +204,9 @@ impl SimState {
             particles: Vec::new(),
             force_matrix: vec![0.0; n * n],
             reaction_table: vec![-1; n * n],
+            reaction_table_dirty: true,
+            trace_len_matrix: vec![0u32; n * n],
+            trace_len_matrix_dirty: true,
             book: Book::new(),
             step_count: 0,
             particles_dirty: true,
@@ -209,19 +254,74 @@ impl SimState {
     pub fn resize_reaction_table(&mut self) {
         let n = self.params.type_count;
         self.reaction_table = vec![-1; n * n];
+        self.reaction_table_dirty = true;
     }
 
     pub fn default_reaction_table(&mut self) {
-        let n = self.params.type_count;
-        for i in 0..n {
-            for j in 0..n {
-                self.reaction_table[i * n + j] = ((i + j) % n) as i32;
+        self.edit_reaction_table(|reaction_table, n| {
+            for i in 0..n {
+                for j in 0..n {
+                    reaction_table[i * n + j] = ((i + j) % n) as i32;
+                }
             }
-        }
+        });
     }
 
     pub fn rx(&self, i: usize, j: usize) -> i32 {
         self.reaction_table[i * self.params.type_count + j]
+    }
+
+    pub fn set_reaction(&mut self, a: usize, b: usize, value: i32) {
+        let n = self.params.type_count;
+        if a >= n || b >= n {
+            return;
+        }
+        let clamped = value.clamp(-1, (n.saturating_sub(1)) as i32);
+        let idx = a * n + b;
+        if self.reaction_table[idx] != clamped {
+            self.reaction_table[idx] = clamped;
+            self.reaction_table_dirty = true;
+            #[cfg(debug_assertions)]
+            println!("[sim] reaction_table_dirty set");
+        }
+    }
+
+    pub fn edit_reaction_table(&mut self, f: impl FnOnce(&mut [i32], usize)) {
+        let n = self.params.type_count;
+        f(&mut self.reaction_table, n);
+        self.reaction_table_dirty = true;
+        #[cfg(debug_assertions)]
+        println!("[sim] reaction_table_dirty set");
+    }
+
+    pub fn set_reactions_enabled(&mut self, v: bool) {
+        if self.params.reactions_enabled != v {
+            self.params.reactions_enabled = v;
+            self.params_dirty = true;
+        }
+    }
+
+    pub fn set_mix_radius(&mut self, v: f32) {
+        let v = v.max(0.0);
+        if self.params.mix_radius != v {
+            self.params.mix_radius = v;
+            self.params_dirty = true;
+        }
+    }
+
+    pub fn set_reaction_probability(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        if self.params.reaction_probability != v {
+            self.params.reaction_probability = v;
+            self.params_dirty = true;
+        }
+    }
+
+    pub fn set_preserve_particle_count(&mut self, v: bool) {
+        if self.params.preserve_particle_count != v {
+            self.params.preserve_particle_count = v;
+            self.params_dirty = true;
+        }
     }
 
     pub fn step(&mut self) {
@@ -234,6 +334,7 @@ impl SimState {
         self.particles_dirty = false;
         self.params_dirty = false;
         self.force_matrix_dirty = false;
+        self.reaction_table_dirty = false;
     }
 
     pub fn spawn_random(&mut self, count: usize) {
@@ -241,11 +342,11 @@ impl SimState {
         let cap = MAX_RENDER_PARTICLES.min(MAX_CPU_PHYSICS_PARTICLES);
         let remaining = cap.saturating_sub(self.particles.len());
         let spawn_n = count.min(remaining);
-        if spawn_n == 0 { 
-            log::warn!("Particle cap reached ({})", cap); 
-            return; 
+        if spawn_n == 0 {
+            log::warn!("Particle cap reached ({})", cap);
+            return;
         }
-        
+
         let mut rng = rand::thread_rng();
         for _ in 0..spawn_n {
             let pos = glam::Vec3::new(
@@ -271,12 +372,14 @@ impl SimState {
     }
 
     pub fn spawn_prefab(&mut self, prefab_index: usize, position: glam::Vec3, prefab_id: i32) {
-        if prefab_index >= self.book.prefabs.len() { return; }
+        if prefab_index >= self.book.prefabs.len() {
+            return;
+        }
         let prefab = &self.book.prefabs[prefab_index];
-        
+
         let cap = MAX_RENDER_PARTICLES.min(MAX_CPU_PHYSICS_PARTICLES);
         let remaining = cap.saturating_sub(self.particles.len());
-        
+
         let mut added = 0;
         for pp in &prefab.particles {
             if added >= remaining {
@@ -295,7 +398,9 @@ impl SimState {
     }
 
     pub fn delete_particles(&mut self, indices: &[usize]) {
-        if indices.is_empty() { return; }
+        if indices.is_empty() {
+            return;
+        }
         let to_delete: std::collections::HashSet<usize> = indices.iter().copied().collect();
         let mut write = 0;
         for read in 0..self.particles.len() {
@@ -309,17 +414,19 @@ impl SimState {
     }
 
     pub fn duplicate_particles(&mut self, indices: &[usize]) {
-        if indices.is_empty() { return; }
-        
+        if indices.is_empty() {
+            return;
+        }
+
         let cap = MAX_RENDER_PARTICLES.min(MAX_CPU_PHYSICS_PARTICLES);
         let remaining = cap.saturating_sub(self.particles.len());
         let to_duplicate = indices.len().min(remaining);
-        
+
         if to_duplicate == 0 {
             log::warn!("Particle cap reached during duplication ({})", cap);
             return;
         }
-        
+
         let orig_len = self.particles.len();
         let mut rng = rand::thread_rng();
         for &idx in indices.iter().take(to_duplicate) {
@@ -353,7 +460,9 @@ impl SimState {
 
     #[allow(dead_code)]
     pub fn move_particles(&mut self, indices: &[usize], delta: glam::Vec3) {
-        if indices.is_empty() { return; }
+        if indices.is_empty() {
+            return;
+        }
         for &idx in indices {
             if idx < self.particles.len() {
                 let pos = &mut self.particles[idx].position;
@@ -373,7 +482,9 @@ impl SimState {
     }
 
     pub fn set_type_count(&mut self, new_count: usize) {
-        if new_count == self.params.type_count { return; }
+        if new_count == self.params.type_count {
+            return;
+        }
         let old_count = self.params.type_count;
         self.params.type_count = new_count;
 
@@ -394,6 +505,17 @@ impl SimState {
             }
         }
         self.reaction_table = new_reaction_table;
+        self.reaction_table_dirty = true;
+
+        // Resize trace length matrix
+        let mut new_trace_len_matrix = vec![0u32; new_count * new_count];
+        for i in 0..old_count.min(new_count) {
+            for j in 0..old_count.min(new_count) {
+                new_trace_len_matrix[i * new_count + j] = self.trace_len_matrix[i * old_count + j];
+            }
+        }
+        self.trace_len_matrix = new_trace_len_matrix;
+        self.trace_len_matrix_dirty = true;
 
         for p in &mut self.particles {
             if p.kind >= new_count as u32 {
