@@ -1,13 +1,10 @@
+pub mod audio_ui;
+pub mod spawn_ui;
+
+use crate::audio::AudioMod;
 use crate::sim::{CpuStepMode, SimState};
 use egui::{Color32, Context, Grid, RichText, Slider};
-use glam::{Vec3, Vec4Swizzles};
-
-// UI modules
-pub mod matrix_ui;
-pub mod selection_ui;
-pub mod trace_ui;
-pub mod debug_ui;
-pub mod book_ui;
+use glam::Vec3;
 
 // ── UiState ───────────────────────────────────────────────────────────────────
 pub struct UiState {
@@ -46,7 +43,6 @@ pub struct UiState {
     // ── Camera projection matrices (written by renderer each frame) ───────────
     pub view_proj: glam::Mat4,
     pub drag_mode: DragMode,
-    pub hover_index: Option<usize>,
     pub viewport: [u32; 2],
     pub view_matrix: glam::Mat4,
     pub slice_center: f32,
@@ -56,11 +52,8 @@ pub struct UiState {
     pub pending_assign_type: u32,
 
     // ── Rule matrix hold-click state ──────────────────────────────────────────
-    pub matrix_hold: Option<(usize, usize, f32)>,
-    pub matrix_hold_timer: f32,
 
     // ── Trail/trace state ───────────────────────────────────────────────────────
-    pub traces: bool, // Java-style simple boolean
     pub trace_len: u32,
     pub trace_fade_alpha: f32,
     pub trace_render_mode: TraceRenderMode,
@@ -69,10 +62,7 @@ pub struct UiState {
     pub debug_trails: bool, // Enable trail debug output
 
     // Trace Matrix State
-    pub trace_show_tools: bool,
     pub trace_paint_value: u32,
-    pub trace_drag_paint: bool,
-    pub trace_show_indices: bool,
     pub trace_symmetry_lock: bool,
     pub trace_hovered_cell: Option<(usize, usize)>,
     pub trace_brush: TraceBrush,
@@ -82,18 +72,46 @@ pub struct UiState {
     pub force_clipboard: Option<Vec<f32>>,
     pub reaction_clipboard: Option<Vec<i32>>,
     pub trace_clipboard: Option<Vec<u32>>,
-    pub show_heat_map: bool,
     pub show_matrix_stats: bool,
     pub force_presets: Vec<String>,
     pub reaction_presets: Vec<String>,
-    pub trace_presets: Vec<String>,
     pub active_matrix_tab: ActiveMatrixTab,
     
-    // Book and profile fields
-    pub selected_creature: Option<usize>,
+    // Profile fields
     pub save_profile_now: bool,
     pub auto_save_profiles: bool,
     pub auto_save_interval: usize,
+
+    // Request renderer to zero the GPU selection flag buffer (new brush
+    // stroke, Clear button, or after deleting particles shifts indices).
+    pub clear_selection_requested: bool,
+
+    // ── UX state ────────────────────────────────────────────────────────────
+    pub matrix_cell_size: f32,               // shared cell size for all matrix tabs
+    pub rules_symmetry: bool,                // mirror edits across the force-matrix diagonal
+    pub reaction_paint: i32,                 // palette selection for the reaction tab (-1 = no reaction)
+    pub matrix_hovered_cell: Option<(usize, usize)>, // last frame's hovered cell (row/col cross-highlight)
+    pub trace_last_painted: Option<(usize, usize)>,  // stroke tracking so Add/Mult brushes fire once per cell
+    pub status: Option<(String, f32)>,       // transient toast: (message, seconds left)
+    pub styled: bool,                        // one-shot egui style application
+    pub strobe: bool,                        // run 2 sim steps per rendered frame (freezes period-2 objects)
+    pub last_used_grid: Option<bool>,        // detect Auto mode silently switching step modes
+
+    // ── Audio-driven matrix modulation ────────────────────────────────
+    pub audio: AudioMod,
+
+    // ── Spawn composition (pie chart) ─────────────────────────────────
+    /// Total pool of particles the chart draws from.
+    pub particle_pool: usize,
+    /// Per-type counts. Resized to type_count by spawn_ui::sync_mix.
+    pub type_mix: Vec<usize>,
+    /// Locked types are never auto-adjusted by even-split / steal.
+    pub mix_locked: Vec<bool>,
+    /// Which wedge has the inline count editor open.
+    pub mix_editing: Option<usize>,
+    pub mix_edit_buf: String,
+    /// Wedge currently being dragged.
+    pub mix_drag: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +126,7 @@ pub enum ActiveMatrixTab {
     Rules,
     Reactions,
     Traces,
+    Audio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,13 +144,6 @@ pub enum TraceBrush {
     Subtract,
     Multiply,
     Erase,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectionOp {
-    Replace,
-    Add,
-    Remove,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,14 +184,11 @@ impl UiState {
             selection_readback_needed: false,
             view_proj: glam::Mat4::IDENTITY,
             gpu_selection_params: crate::renderer::compute::SelectionParams {
-                mode_flags: [0, 0, 0, 0],     // mode + flags/padding
-                rect_min: [0.0, 0.0, 0.0, 0.0], // rect_min + padding
-                rect_max: [0.0, 0.0, 0.0, 0.0], // rect_max + padding
-                brush_data: [0.0, 0.0, 40.0, 0.0], // brush_center.x, brush_center.y, brush_radius, slice_depth
+                brush_data: [0.0, 0.0, 40.0, 0.0],
+                ..Default::default()
             },
 
             drag_mode: DragMode::None,
-            hover_index: None,
             viewport: [1, 1],
             view_matrix: glam::Mat4::IDENTITY,
             slice_center: 0.0,
@@ -188,10 +197,7 @@ impl UiState {
             move_start_positions: Vec::new(),
             pending_assign_type: 0,
 
-            matrix_hold: None,
-            matrix_hold_timer: 0.0,
 
-            traces: false, // Java-style: start with traces off
             trace_len: 16,
             trace_fade_alpha: 0.98,
             trace_render_mode: TraceRenderMode::Off,
@@ -200,10 +206,7 @@ impl UiState {
             debug_trails: false, // Debug output off by default
 
             // Trace Matrix State
-            trace_show_tools: true,
             trace_paint_value: 30,
-            trace_drag_paint: false,
-            trace_show_indices: true,
             trace_symmetry_lock: false,
             trace_hovered_cell: None,
             trace_brush: TraceBrush::Set,
@@ -213,19 +216,42 @@ impl UiState {
             force_clipboard: None,
             reaction_clipboard: None,
             trace_clipboard: None,
-            show_heat_map: false,
             show_matrix_stats: false,
             force_presets: Vec::new(),
             reaction_presets: Vec::new(),
-            trace_presets: Vec::new(),
             active_matrix_tab: ActiveMatrixTab::Rules,
             
-            // Book and profile fields
-            selected_creature: None,
+            // Profile fields
             save_profile_now: false,
             auto_save_profiles: false,
             auto_save_interval: 500,
+
+            clear_selection_requested: false,
+
+            matrix_cell_size: 32.0,
+            rules_symmetry: false,
+            reaction_paint: 0,
+            matrix_hovered_cell: None,
+            trace_last_painted: None,
+            status: None,
+            styled: false,
+            strobe: false,
+            last_used_grid: None,
+
+            audio: AudioMod::new(),
+
+            particle_pool: 10_000,
+            type_mix: Vec::new(),
+            mix_locked: Vec::new(),
+            mix_editing: None,
+            mix_edit_buf: String::new(),
+            mix_drag: None,
         }
+    }
+
+    /// Show a small transient toast in the corner (copy/paste feedback, etc).
+    pub fn flash(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), 2.0));
     }
 
     /// Forward direction in world space from current yaw/pitch
@@ -243,22 +269,29 @@ impl UiState {
         self.fly_forward().cross(Vec3::Y).normalize()
     }
 
-    #[allow(dead_code)]
-    pub fn world_to_screen(&self, pos: Vec3, viewport: [u32; 2]) -> Option<egui::Pos2> {
-        let clip = self.view_proj * pos.extend(1.0);
-        if clip.w <= 0.0 {
-            return None;
-        }
-        let ndc = clip.xyz() / clip.w;
-        Some(egui::pos2(
-            (ndc.x * 0.5 + 0.5) * viewport[0] as f32,
-            (1.0 - (ndc.y * 0.5 + 0.5)) * viewport[1] as f32,
-        ))
-    }
 }
 
 // ── Main UI entry point ───────────────────────────────────────────────────────
 pub fn draw_ui(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
+    if !ui.styled {
+        apply_style(ctx);
+        ui.styled = true;
+    }
+    // Audio modulation runs before any panel draws so meters and matrix cells
+    // in this frame show the values that were actually uploaded.
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    ui.audio.tick(sim, dt);
+    if ui.audio.playing {
+        ctx.request_repaint();
+    }
+
+    // Keep the spawn chart in step with type_count, and seed it from the live
+    // population on the first frame (SimState::new spawns 512 before any UI runs).
+    if ui.type_mix.is_empty() && !sim.particles.is_empty() {
+        crate::ui::spawn_ui::adopt_current(sim, ui);
+    }
+    crate::ui::spawn_ui::sync_mix(sim, ui);
+
     draw_controls(ctx, sim, ui);
     if ui.show_matrix_editor {
         draw_tabbed_matrices(ctx, sim, ui);
@@ -267,6 +300,152 @@ pub fn draw_ui(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
         draw_book(ctx, sim, ui);
     }
     handle_input(ctx, sim, ui);
+    draw_status_flash(ctx, ui);
+}
+
+/// One-shot egui style: bigger click targets, consistent rounding, filled sliders.
+fn apply_style(ctx: &Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.slider_width = 150.0;
+    style.spacing.interact_size.y = 22.0;
+    let round = egui::Rounding::same(5.0);
+    style.visuals.widgets.inactive.rounding = round;
+    style.visuals.widgets.hovered.rounding = round;
+    style.visuals.widgets.active.rounding = round;
+    style.visuals.widgets.open.rounding = round;
+    style.visuals.widgets.noninteractive.rounding = round;
+    style.visuals.widgets.hovered.expansion = 1.0;
+    style.visuals.window_rounding = egui::Rounding::same(8.0);
+    style.visuals.slider_trailing_fill = true;
+    ctx.set_style(style);
+}
+
+/// Transient toast in the bottom-left corner ("Copied", "Profile saved", ...).
+fn draw_status_flash(ctx: &Context, ui: &mut UiState) {
+    if let Some((msg, t)) = &mut ui.status {
+        *t -= ctx.input(|i| i.stable_dt).min(0.1);
+        if *t <= 0.0 {
+            ui.status = None;
+            return;
+        }
+        let msg = msg.clone();
+        egui::Area::new(egui::Id::new("status_flash"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+            .interactable(false)
+            .show(ctx, |e| {
+                egui::Frame::popup(&ctx.style()).show(e, |e| {
+                    e.label(RichText::new(msg).strong());
+                });
+            });
+        // Keep the timer ticking even when the sim is paused/idle.
+        ctx.request_repaint();
+    }
+}
+
+// ── Matrix cell widgets ─────────────────────────────────────────────────────
+fn cell_dims(size: f32) -> egui::Vec2 {
+    egui::vec2(size, (size * 0.78).max(16.0))
+}
+
+/// Is the pointer over this cell right now?
+///
+/// `Response::hovered()` goes false the moment any widget captures the pointer
+/// press — including a ScrollArea's drag-to-scroll — so it can't be used to
+/// drive drag-painting. Hit-testing the rect directly survives the press.
+fn cell_hit(e: &egui::Ui, resp: &egui::Response) -> bool {
+    e.input(|i| i.pointer.interact_pos()).map_or(false, |p| {
+        resp.rect.contains(p) && e.clip_rect().contains(p)
+    })
+}
+
+/// A painted matrix cell. Cheap (no Button layout), hover-brightened, with
+/// optional centered monospace text in a contrast color.
+fn matrix_cell(
+    e: &mut egui::Ui,
+    size: f32,
+    fill: Color32,
+    text: Option<String>,
+    sense: egui::Sense,
+    selected: bool,
+) -> egui::Response {
+    let (rect, resp) = e.allocate_exact_size(cell_dims(size), sense);
+    if e.is_rect_visible(rect) {
+        let pointer_over = e
+            .input(|i| i.pointer.interact_pos())
+            .map_or(false, |p| rect.contains(p) && e.clip_rect().contains(p));
+        let active = resp.hovered() || resp.dragged() || pointer_over;
+        let fill = if active {
+            Color32::from_rgb(
+                fill.r().saturating_add(26),
+                fill.g().saturating_add(26),
+                fill.b().saturating_add(26),
+            )
+        } else {
+            fill
+        };
+        let painter = e.painter();
+        painter.rect_filled(rect, 3.0, fill);
+        if selected {
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(2.0, Color32::WHITE));
+        } else if active {
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, Color32::from_gray(220)));
+        }
+        if let Some(t) = text {
+            let lum = fill.r() as u32 + fill.g() as u32 + fill.b() as u32;
+            let text_color = if lum > 400 {
+                Color32::from_gray(15)
+            } else {
+                Color32::from_gray(235)
+            };
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                t,
+                egui::FontId::monospace((size * 0.32).clamp(9.0, 12.0)),
+                text_color,
+            );
+        }
+    }
+    resp
+}
+
+/// Row/column header: a colored dot for the particle type, with a subtle
+/// backing when its row/column is hovered.
+fn type_header(e: &mut egui::Ui, idx: usize, size: f32, highlight: bool) {
+    let (rect, resp) = e.allocate_exact_size(cell_dims(size), egui::Sense::hover());
+    if e.is_rect_visible(rect) {
+        let painter = e.painter();
+        if highlight {
+            painter.rect_filled(rect, 3.0, Color32::from_gray(70));
+        }
+        painter.circle_filled(
+            rect.center(),
+            (size * 0.20).clamp(4.0, 8.0),
+            type_color_egui(idx),
+        );
+    }
+    resp.on_hover_text(format!("Type {idx}"));
+}
+
+/// Auto-shrink cells for big matrices so 32×32 still fits on screen.
+fn effective_cell_size(user: f32, n: usize) -> f32 {
+    if n > 16 {
+        user.min(22.0)
+    } else {
+        user
+    }
+}
+
+/// Read and consume vertical scroll while hovering a matrix cell, so
+/// fine-tuning a value doesn't also scroll the surrounding ScrollArea.
+fn take_scroll(ctx: &Context) -> f32 {
+    ctx.input_mut(|i| {
+        let s = i.smooth_scroll_delta.y;
+        i.smooth_scroll_delta.y = 0.0;
+        s
+    })
 }
 
 // ── Tabbed Matrix Editor ───────────────────────────────────────────────────────
@@ -276,7 +455,7 @@ fn draw_tabbed_matrices(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
         .resizable(true)
         .default_width(600.0)
         .show(ctx, |e| {
-            // Tab selection
+            // Tab selection + shared cell-size control
             e.horizontal(|e| {
                 e.selectable_value(&mut ui.active_matrix_tab, ActiveMatrixTab::Rules, "Rules");
                 e.selectable_value(
@@ -285,6 +464,17 @@ fn draw_tabbed_matrices(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                     "Reactions",
                 );
                 e.selectable_value(&mut ui.active_matrix_tab, ActiveMatrixTab::Traces, "Traces");
+                e.selectable_value(&mut ui.active_matrix_tab, ActiveMatrixTab::Audio, "Audio");
+                e.with_layout(egui::Layout::right_to_left(egui::Align::Center), |e| {
+                    e.add(
+                        egui::DragValue::new(&mut ui.matrix_cell_size)
+                            .speed(0.5)
+                            .clamp_range(18.0..=48.0)
+                            .suffix(" px"),
+                    )
+                    .on_hover_text("Matrix cell size (drag)");
+                    e.label("cells:");
+                });
             });
             e.separator();
 
@@ -293,31 +483,11 @@ fn draw_tabbed_matrices(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                 ActiveMatrixTab::Rules => draw_rule_matrix_content(ctx, sim, ui, e),
                 ActiveMatrixTab::Reactions => draw_reaction_matrix_content(ctx, sim, ui, e),
                 ActiveMatrixTab::Traces => draw_trace_matrix_content(ctx, sim, ui, e),
+                ActiveMatrixTab::Audio => {
+                    crate::ui::audio_ui::draw_audio_matrix_content(ctx, sim, ui, e)
+                }
             }
         });
-}
-
-// ── Selection helpers ─────────────────────────────────────────────────────────
-fn apply_selection_op(selected: &mut Vec<usize>, hits: &[usize], op: SelectionOp) {
-    match op {
-        SelectionOp::Replace => {
-            selected.clear();
-            selected.extend_from_slice(hits);
-        }
-        SelectionOp::Add => {
-            selected.extend_from_slice(hits);
-        }
-        SelectionOp::Remove => {
-            let rm: std::collections::HashSet<_> = hits.iter().copied().collect();
-            selected.retain(|i| !rm.contains(i));
-        }
-    }
-    dedup_selection(selected);
-}
-
-fn dedup_selection(v: &mut Vec<usize>) {
-    v.sort_unstable();
-    v.dedup();
 }
 
 fn set_trace_cell(
@@ -363,103 +533,122 @@ fn draw_trace_matrix_ui(
                 ui.selectable_value(&mut state.trace_render_mode, TraceRenderMode::Dots, "Dots");
             });
 
-        ui.add(egui::Slider::new(&mut state.trace_len, 1..=20).text("history"));
+        ui.add(
+            egui::Slider::new(&mut state.trace_len, 1..=crate::renderer::compute::MAX_TRAIL)
+                .text("history"),
+        );
         ui.add(egui::Slider::new(&mut state.trace_fade_alpha, 0.0..=1.0).text("fade"));
+        ui.checkbox(&mut state.trace_ui_edit_only, "edit only")
+            .on_hover_text("Edit the trace matrix without rendering trails");
     });
 
     ui.separator();
+    ui.label(
+        RichText::new("pick a brush · click/drag cells to paint · right-click erase").weak(),
+    );
 
-    ui.collapsing("Trace Matrix Tools", |ui| {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut state.trace_show_tools, "show tools");
-            ui.checkbox(&mut state.trace_show_indices, "indices");
-            ui.checkbox(&mut state.trace_symmetry_lock, "symmetry");
-            ui.checkbox(&mut state.trace_drag_paint, "drag paint");
-        });
+    ui.horizontal(|ui| {
+        ui.label("Brush:");
+        egui::ComboBox::from_id_source("trace_brush")
+            .selected_text(format!("{:?}", state.trace_brush))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.trace_brush, TraceBrush::Set, "Set");
+                ui.selectable_value(&mut state.trace_brush, TraceBrush::Add, "Add");
+                ui.selectable_value(&mut state.trace_brush, TraceBrush::Subtract, "Subtract");
+                ui.selectable_value(&mut state.trace_brush, TraceBrush::Multiply, "Multiply");
+                ui.selectable_value(&mut state.trace_brush, TraceBrush::Erase, "Erase");
+            });
 
-        ui.horizontal(|ui| {
-            ui.label("Brush:");
-            egui::ComboBox::from_label("")
-                .selected_text(format!("{:?}", state.trace_brush))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.trace_brush, TraceBrush::Set, "Set");
-                    ui.selectable_value(&mut state.trace_brush, TraceBrush::Add, "Add");
-                    ui.selectable_value(&mut state.trace_brush, TraceBrush::Subtract, "Subtract");
-                    ui.selectable_value(&mut state.trace_brush, TraceBrush::Multiply, "Multiply");
-                    ui.selectable_value(&mut state.trace_brush, TraceBrush::Erase, "Erase");
-                });
-
-            ui.label("Paint lifetime:");
-            ui.add(egui::DragValue::new(&mut state.trace_paint_value)
+        ui.label("lifetime:");
+        ui.add(
+            egui::DragValue::new(&mut state.trace_paint_value)
                 .speed(1)
-                .clamp_range(0..=600));
+                .clamp_range(0..=600),
+        )
+        .on_hover_text("Value painted into cells (steps)");
 
-            if ui.button("Clear all").clicked() {
-                for v in &mut sim.trace_len_matrix {
-                    *v = 0;
-                }
-                sim.trace_len_matrix_dirty = true;
-            }
-
-            if ui.button("Fill all").clicked() {
-                for v in &mut sim.trace_len_matrix {
-                    *v = state.trace_paint_value;
-                }
-                sim.trace_len_matrix_dirty = true;
-            }
-
-            if ui.button("Diag only").clicked() {
-                for r in 0..n {
-                    for c in 0..n {
-                        sim.trace_len_matrix[r * n + c] =
-                            if r == c { state.trace_paint_value } else { 0 };
-                    }
-                }
-                sim.trace_len_matrix_dirty = true;
-            }
-
-            if ui.button("From reactions").clicked() {
-                for r in 0..n {
-                    for c in 0..n {
-                        let reaction_idx = r * n + c;
-                        let trace_idx = r * n + c;
-                        if trace_idx < sim.trace_len_matrix.len() && reaction_idx < sim.reaction_table.len() {
-                            sim.trace_len_matrix[trace_idx] = if sim.reaction_table[reaction_idx] > 0 { state.trace_paint_value } else { 0 };
-                        }
-                    }
-                }
-                sim.trace_len_matrix_dirty = true;
-            }
-        });
-
-        let active = sim.trace_len_matrix.iter().filter(|&&v| v > 0).count();
-        ui.label(format!(
-            "Active trace cells: {}/{} | dirty: {} | hovered: {:?}",
-            active,
-            n * n,
-            sim.trace_len_matrix_dirty,
-            state.trace_hovered_cell
-        ));
+        ui.checkbox(&mut state.trace_symmetry_lock, "mirror")
+            .on_hover_text("Edits apply to both (i,j) and (j,i)");
     });
 
-    ui.separator();
-
-    // Debug Panel
-    ui.collapsing("Trace Debug", |ui| {
-        ui.label(format!("trace_len_matrix_dirty: {}", sim.trace_len_matrix_dirty));
-        ui.label(format!("active cells: {}", sim.trace_len_matrix.iter().filter(|&&v| v > 0).count()));
-        ui.label(format!("matrix size: {}x{}", n, n));
-        ui.label(format!("trace_len: {}", state.trace_len));
-        ui.label(format!("trigger_only: {}", state.trace_trigger_only));
-        
-        // Add more debug info as available
-        if let Some((r, c)) = state.trace_hovered_cell {
-            let idx = r * n + c;
-            if idx < sim.trace_len_matrix.len() {
-                ui.label(format!("hovered cell ({},{}) value: {}", r, c, sim.trace_len_matrix[idx]));
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Clear all").clicked() {
+            for v in &mut sim.trace_len_matrix {
+                *v = 0;
+            }
+            sim.trace_len_matrix_dirty = true;
+            state.flash("Trace matrix cleared");
+        }
+        if ui.button("Fill all").clicked() {
+            for v in &mut sim.trace_len_matrix {
+                *v = state.trace_paint_value;
+            }
+            sim.trace_len_matrix_dirty = true;
+            state.flash("Trace matrix filled");
+        }
+        if ui.button("Diag only").clicked() {
+            for r in 0..n {
+                for c in 0..n {
+                    sim.trace_len_matrix[r * n + c] =
+                        if r == c { state.trace_paint_value } else { 0 };
+                }
+            }
+            sim.trace_len_matrix_dirty = true;
+        }
+        if ui.button("Copy").clicked() {
+            state.trace_clipboard = Some(sim.trace_len_matrix.clone());
+            state.flash("Trace matrix copied");
+        }
+        if ui.button("Paste").clicked() {
+            if let Some(ref matrix) = state.trace_clipboard {
+                if matrix.len() == n * n {
+                    sim.trace_len_matrix.copy_from_slice(matrix);
+                    sim.trace_len_matrix_dirty = true;
+                    state.flash("Trace matrix pasted");
+                } else {
+                    state.flash("Clipboard is a different size");
+                }
             }
         }
+        egui::ComboBox::from_id_source("trace_presets")
+            .selected_text("Presets...")
+            .show_ui(ui, |ui| {
+                for preset in [
+                    "Short Trails",
+                    "Long Trails",
+                    "Diagonal Pattern",
+                    "Cross Pattern",
+                    "Random Burst",
+                ] {
+                    if ui.selectable_label(false, preset).clicked() {
+                        apply_trace_preset(sim, preset, state.trace_paint_value.max(1));
+                        state.flash(format!("Preset: {preset}"));
+                    }
+                }
+            });
+        if ui.button("From reactions").clicked() {
+            for r in 0..n {
+                for c in 0..n {
+                    let reaction_idx = r * n + c;
+                    let trace_idx = r * n + c;
+                    if trace_idx < sim.trace_len_matrix.len()
+                        && reaction_idx < sim.reaction_table.len()
+                    {
+                        sim.trace_len_matrix[trace_idx] =
+                            if sim.reaction_table[reaction_idx] > 0 {
+                                state.trace_paint_value
+                            } else {
+                                0
+                            };
+                    }
+                }
+            }
+            sim.trace_len_matrix_dirty = true;
+        }
     });
+
+    let active = sim.trace_len_matrix.iter().filter(|&&v| v > 0).count();
+    ui.label(RichText::new(format!("Active trace cells: {}/{}", active, n * n)).weak());
 
     ui.separator();
 
@@ -471,121 +660,100 @@ fn draw_trace_matrix_ui(
     // Find max value for heatmap normalization
     let max_value = sim.trace_len_matrix.iter().copied().max().unwrap_or(1).max(1);
 
+    let hovered_last = state.trace_hovered_cell;
+    state.trace_hovered_cell = None;
+    let cell = effective_cell_size(state.matrix_cell_size, n);
+    let show_text = cell >= 28.0;
+    let (pdown, sdown) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
+    if !pdown {
+        // Stroke ended: Add/Subtract/Multiply brushes may fire again per cell
+        state.trace_last_painted = None;
+    }
+
     egui::ScrollArea::both()
         .auto_shrink([false, false])
+        .drag_to_scroll(false) // otherwise the ScrollArea eats the paint drag
         .max_height(420.0)
         .show(ui, |ui| {
             egui::Grid::new("trace_matrix_grid")
                 .spacing([2.0, 2.0])
-                .striped(true)
                 .show(ui, |ui| {
                     ui.label("");
-
                     for c in 0..n {
-                        if state.trace_show_indices {
-                            ui.label(format!("{c}"));
-                        } else {
-                            ui.label("");
-                        }
+                        type_header(ui, c, cell, hovered_last.map_or(false, |(_, cc)| cc == c));
                     }
                     ui.end_row();
 
                     for r in 0..n {
-                        if state.trace_show_indices {
-                            ui.label(format!("{r}"));
-                        } else {
-                            ui.label("");
-                        }
+                        type_header(ui, r, cell, hovered_last.map_or(false, |(rr, _)| rr == r));
 
                         for c in 0..n {
                             let idx = r * n + c;
                             let value = sim.trace_len_matrix[idx];
 
-                            // Heatmap coloring
-                            let t = (value as f32 / max_value as f32).clamp(0.0, 1.0);
+                            // Heatmap: dark → amber
                             let color = if value == 0 {
-                                egui::Color32::from_rgb(40, 40, 40) // Dark for zero
+                                Color32::from_rgb(38, 38, 42)
                             } else {
-                                egui::Color32::from_rgb(
-                                    (t * 255.0) as u8,           // Red channel
-                                    ((1.0 - (t - 0.5).abs() * 2.0) * 255.0) as u8, // Green channel (peaks at middle)
-                                    ((1.0 - t) * 255.0) as u8,    // Blue channel
-                                )
+                                let t = (value as f32 / max_value as f32).clamp(0.0, 1.0);
+                                let lerp =
+                                    |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+                                Color32::from_rgb(lerp(70, 255), lerp(72, 178), lerp(110, 44))
                             };
 
-                            let button_text = if value == 0 {
-                                ".".to_string()
-                            } else {
-                                value.to_string()
-                            };
-
-                            let response = ui.add_sized(
-                                [34.0, 24.0],
-                                egui::Button::new(button_text)
-                                    .fill(color),
+                            // Sense::hover so painting sweeps across cells while dragging
+                            let resp = matrix_cell(
+                                ui,
+                                cell,
+                                color,
+                                show_text.then(|| {
+                                    if value == 0 {
+                                        "·".to_string()
+                                    } else {
+                                        value.to_string()
+                                    }
+                                }),
+                                egui::Sense::hover(),
+                                false,
                             );
 
-                            if response.hovered() {
+                            // Rect hit-test, not resp.hovered(): hover is
+                            // suppressed for the whole duration of a press.
+                            if cell_hit(ui, &resp) {
                                 state.trace_hovered_cell = Some((r, c));
+
+                                if pdown {
+                                    // Fire once per cell per stroke so Add/Multiply
+                                    // don't run away at 60 fps
+                                    if state.trace_last_painted != Some((r, c)) {
+                                        state.trace_last_painted = Some((r, c));
+                                        let paint = state.trace_paint_value;
+                                        let new_value = match state.trace_brush {
+                                            TraceBrush::Set => paint,
+                                            TraceBrush::Add => value.saturating_add(paint),
+                                            TraceBrush::Subtract => value.saturating_sub(paint),
+                                            TraceBrush::Multiply => value.saturating_mul(paint),
+                                            TraceBrush::Erase => 0,
+                                        };
+                                        if new_value != value {
+                                            set_trace_cell(
+                                                sim,
+                                                r,
+                                                c,
+                                                new_value,
+                                                state.trace_symmetry_lock,
+                                            );
+                                        }
+                                    }
+                                } else if sdown && value != 0 {
+                                    set_trace_cell(sim, r, c, 0, state.trace_symmetry_lock);
+                                }
                             }
 
-                            if response.clicked() {
-                                let new_value = match state.trace_brush {
-                                    TraceBrush::Set => {
-                                        if value == state.trace_paint_value { 0 } else { state.trace_paint_value }
-                                    },
-                                    TraceBrush::Add => value.saturating_add(state.trace_paint_value),
-                                    TraceBrush::Subtract => value.saturating_sub(state.trace_paint_value),
-                                    TraceBrush::Multiply => value.saturating_mul(state.trace_paint_value),
-                                    TraceBrush::Erase => 0,
-                                };
-
-                                set_trace_cell(
-                                    sim,
-                                    r,
-                                    c,
-                                    new_value,
-                                    state.trace_symmetry_lock,
-                                );
-                            }
-
-                            if state.trace_drag_paint
-                                && response.hovered()
-                                && ui.input(|i| i.pointer.primary_down())
-                            {
-                                let new_value = match state.trace_brush {
-                                    TraceBrush::Set => state.trace_paint_value,
-                                    TraceBrush::Add => value.saturating_add(state.trace_paint_value),
-                                    TraceBrush::Subtract => value.saturating_sub(state.trace_paint_value),
-                                    TraceBrush::Multiply => value.saturating_mul(state.trace_paint_value),
-                                    TraceBrush::Erase => 0,
-                                };
-
-                                set_trace_cell(
-                                    sim,
-                                    r,
-                                    c,
-                                    new_value,
-                                    state.trace_symmetry_lock,
-                                );
-                            }
-
-                            if response.secondary_clicked() {
-                                set_trace_cell(
-                                    sim,
-                                    r,
-                                    c,
-                                    0,
-                                    state.trace_symmetry_lock,
-                                );
-                            }
-
-                            response.on_hover_text(format!(
-                                "Trace {} -> {}\nLifetime: {}\nBrush: {:?}\nLeft click: apply brush\nRight click: clear",
-                                r, c, value, state.trace_brush
+                            resp.on_hover_text(format!(
+                                "T{r} + T{c}: {value} steps\npaint = LMB drag · erase = RMB"
                             ));
                         }
-
                         ui.end_row();
                     }
                 });
@@ -598,8 +766,36 @@ fn draw_trace_matrix_ui(
 fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
     let dt = ctx.input(|i| i.stable_dt);
 
+    // ── Keyboard shortcuts (skipped while typing in a text field) ─────────────
+    if !ctx.wants_keyboard_input() {
+        ctx.input(|i| {
+            use egui::Key;
+            if i.key_pressed(Key::Space) {
+                ui.paused = !ui.paused;
+            }
+            if i.key_pressed(Key::N) {
+                ui.step_once = true;
+            }
+            if i.key_pressed(Key::M) {
+                ui.show_matrix_editor = !ui.show_matrix_editor;
+            }
+            if i.key_pressed(Key::B) {
+                ui.show_book = !ui.show_book;
+            }
+            if i.key_pressed(Key::Num1) {
+                ui.selection_mode = SelectionMode::Rect;
+            }
+            if i.key_pressed(Key::Num2) {
+                ui.selection_mode = SelectionMode::Brush;
+            }
+            if i.key_pressed(Key::Num3) {
+                ui.selection_mode = SelectionMode::Slice;
+            }
+        });
+    }
+
     // Toggle trail with T key - cycle through functional modes (skip Simple)
-    if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+    if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::T)) {
         ui.trace_render_mode = match ui.trace_render_mode {
             TraceRenderMode::Off => TraceRenderMode::Dots,
             TraceRenderMode::Simple => TraceRenderMode::Dots,
@@ -666,7 +862,6 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
 
     // ── SELECTION MODE — only outside UI panels ───────────────────────────────
     if ctx.is_pointer_over_area() {
-        ui.hover_index = None;
         if ui.drag_mode == DragMode::None {
             ui.highlighted_indices.clear();
         }
@@ -682,10 +877,10 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
         return;
     }
 
-    // Hover preview when idle - clear GPU selection when not interacting
+    // Idle: deactivate the selection tool. Mode 0 preserves existing GPU
+    // selection flags, so a finished selection keeps its highlight.
     if ui.drag_mode == DragMode::None && !pointer.any_down() {
-        ui.gpu_selection_params.mode_flags[0] = 0; // No selection
-        ui.hover_index = None;
+        ui.gpu_selection_params.mode_flags[0] = 0;
         ui.highlighted_indices.clear();
     }
 
@@ -704,12 +899,16 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
                     ui.gpu_selection_params.rect_max = [pos.x, pos.y, 0.0, 0.0];
                 }
                 SelectionMode::Brush => {
+                    // Brush accumulates along the stroke, so a new stroke
+                    // starts from an empty selection.
+                    ui.clear_selection_requested = true;
                     ui.gpu_selection_params.mode_flags[0] = 2; // Brush mode
                     ui.gpu_selection_params.brush_data = [pos.x, pos.y, ui.brush_radius, 0.0];
                 }
                 SelectionMode::Slice => {
                     ui.gpu_selection_params.mode_flags[0] = 3; // Slice mode
-                    ui.gpu_selection_params.brush_data = [0.0, 0.0, 0.0, ui.slice_center];
+                    ui.gpu_selection_params.brush_data =
+                        [0.0, 0.0, ui.slice_thickness, ui.slice_center];
                 }
             }
         }
@@ -730,7 +929,8 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
                     ui.gpu_selection_params.brush_data = [pos.x, pos.y, ui.brush_radius, 0.0];
                 }
                 SelectionMode::Slice => {
-                    ui.gpu_selection_params.brush_data = [0.0, 0.0, 0.0, ui.slice_center];
+                    ui.gpu_selection_params.brush_data =
+                        [0.0, 0.0, ui.slice_thickness, ui.slice_center];
                 }
             }
         }
@@ -797,8 +997,15 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
     egui::Window::new("Controls")
         .default_pos([12.0, 12.0])
         .default_width(260.0)
-        .resizable(false)
+        .resizable(true)
         .show(ctx, |e| {
+            // The panel outgrew most screens once Spawn gained the chart, so the
+            // whole body scrolls. auto_shrink keeps it from collapsing to nothing
+            // when a section is folded away.
+            egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_source("controls_scroll")
+            .show(e, |e| {
             e.label(format!("Particles: {}", sim.particles.len()));
             e.label(format!("Types:     {}", sim.params.type_count));
             e.label(format!("Steps:     {}", sim.step_count));
@@ -806,263 +1013,317 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
 
             e.horizontal(|e| {
                 let lbl = if ui.paused { "▶ Resume" } else { "⏸ Pause" };
-                if e.button(lbl).clicked() {
+                if e.add_sized([140.0, 28.0], egui::Button::new(RichText::new(lbl).size(15.0)))
+                    .on_hover_text("Space")
+                    .clicked()
+                {
                     ui.paused = !ui.paused;
                 }
-                if e.button("⏭ Step").clicked() {
+                if e.add_sized([70.0, 28.0], egui::Button::new("⏭ Step"))
+                    .on_hover_text("N — while strobing, one Step flips the visible phase")
+                    .clicked()
+                {
                     ui.step_once = true;
                 }
             });
+            e.checkbox(&mut ui.strobe, "Strobe ×2").on_hover_text(
+                "Run two sim steps per rendered frame so period-2 oscillating\n\
+                 objects appear frozen instead of flickering.\n\
+                 ⏭ Step (while paused) advances one step to view the other phase.",
+            );
+
+            // Auto step mode can silently swap the interaction model at the
+            // particle-count threshold — announce it, because a knife-edge
+            // object dissolving for no visible reason is maddening.
+            if !ui.use_gpu_physics {
+                let used = sim.last_step_used_grid;
+                if let Some(prev) = ui.last_used_grid {
+                    if prev != used && matches!(sim.params.cpu_step_mode, CpuStepMode::Auto) {
+                        ui.flash(if used {
+                            "Auto: CPU switched to GridExact"
+                        } else {
+                            "Auto: CPU switched to Naive"
+                        });
+                    }
+                }
+                ui.last_used_grid = Some(used);
+            } else {
+                ui.last_used_grid = None;
+            }
             e.separator();
 
             e.checkbox(&mut ui.use_gpu_physics, "Use GPU Physics");
             e.separator();
 
-            e.label("Physics");
             let mut changed = false;
+            egui::CollapsingHeader::new("Physics")
+                .default_open(true)
+                .show(e, |e| {
 
-            let mut type_count = sim.params.type_count as f32;
-            if e.add(
-                Slider::new(
-                    &mut type_count,
-                    1.0..=crate::renderer::compute::MAX_TYPES as f32,
+                let mut type_count = sim.params.type_count;
+                if e.add(
+                    Slider::new(&mut type_count, 1..=crate::renderer::compute::MAX_TYPES)
+                        .text("types"),
                 )
-                .text("types"),
-            )
-            .changed()
-            {
-                let nc = type_count as usize;
-                if nc != sim.params.type_count {
-                    sim.set_type_count(nc);
-                }
-            }
-
-            let r_max_max = if ui.cap_to_bounds {
-                sim.params.bounds
-            } else {
-                20.0
-            };
-            changed |= e
-                .add(Slider::new(&mut sim.params.r_max, 0.001..=r_max_max).text("r_max"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.force_scale, 0.0..=20.0).text("force scale"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.friction, 0.0..=1.0).text("friction"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.dt, 0.0001..=0.1).text("dt"))
-                .changed();
-            let max_speed_max = if ui.cap_to_bounds {
-                sim.params.bounds
-            } else {
-                20.0
-            };
-            changed |= e
-                .add(Slider::new(&mut sim.params.max_speed, 0.01..=max_speed_max).text("max speed"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.beta, 0.01..=0.99).text("beta"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.particle_size, 0.001..=0.2).text("particle size"))
-                .changed();
-            changed |= e
-                .add(Slider::new(&mut sim.params.bounds, 0.1..=20.0).text("bounds"))
-                .changed();
-            changed |= e
-                .checkbox(&mut ui.cap_to_bounds, "Cap sliders to bounds")
-                .changed();
-            changed |= e.checkbox(&mut sim.params.wrap, "Wrap").changed();
-
-            e.separator();
-            e.checkbox(&mut ui.show_matrix_editor, "Matrix Editor");
-            e.separator();
-            e.label("CPU step mode");
-            e.horizontal(|e| {
-                let is_auto = matches!(sim.params.cpu_step_mode, CpuStepMode::Auto);
-                let is_naive = matches!(sim.params.cpu_step_mode, CpuStepMode::Naive);
-                let is_grid = matches!(sim.params.cpu_step_mode, CpuStepMode::GridExact);
-
-                if e.selectable_label(is_auto, "Auto").clicked() {
-                    sim.params.cpu_step_mode = CpuStepMode::Auto;
-                    changed = true;
-                }
-                if e.selectable_label(is_naive, "Naive").clicked() {
-                    sim.params.cpu_step_mode = CpuStepMode::Naive;
-                    changed = true;
-                }
-                if e.selectable_label(is_grid, "GridExact").clicked() {
-                    sim.params.cpu_step_mode = CpuStepMode::GridExact;
-                    changed = true;
-                }
-            });
-
-            let mut auto_threshold = sim.params.auto_grid_threshold as u32;
-            if e.add(Slider::new(&mut auto_threshold, 0..=50_000).text("grid threshold"))
                 .changed()
-            {
-                sim.params.auto_grid_threshold = auto_threshold as usize;
-                changed = true;
-            }
+                {
+                    if type_count != sim.params.type_count {
+                        sim.set_type_count(type_count);
+                    }
+                }
 
-            let resolved_mode = if sim.last_step_used_grid {
-                "GridExact"
-            } else {
-                "Naive"
-            };
-            e.label(format!("Last resolved mode: {}", resolved_mode));
-            e.label(format!("Neighbor checks: {}", sim.last_neighbor_checks));
-            e.label(format!("Grid resolution: {}", sim.last_grid_res));
-            e.label(format!("Last step time: {:.3} ms", sim.last_step_ms));
-            e.label(format!("Avg step time: {:.3} ms", sim.avg_step_ms));
+                let r_max_max = if ui.cap_to_bounds {
+                    sim.params.bounds
+                } else {
+                    20.0
+                };
+                changed |= e
+                    .add(Slider::new(&mut sim.params.r_max, 0.001..=r_max_max).text("r_max"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.force_scale, 0.0..=20.0).text("force scale"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.friction, 0.0..=1.0).text("friction"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.dt, 0.0001..=0.1).text("dt"))
+                    .changed();
+                let max_speed_max = if ui.cap_to_bounds {
+                    sim.params.bounds
+                } else {
+                    20.0
+                };
+                changed |= e
+                    .add(Slider::new(&mut sim.params.max_speed, 0.01..=max_speed_max).text("max speed"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.beta, 0.01..=0.99).text("beta"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.particle_size, 0.001..=0.2).text("particle size"))
+                    .changed();
+                changed |= e
+                    .add(Slider::new(&mut sim.params.bounds, 0.1..=20.0).text("bounds"))
+                    .changed();
+                changed |= e
+                    .checkbox(&mut ui.cap_to_bounds, "Cap sliders to bounds")
+                    .changed();
+                changed |= e.checkbox(&mut sim.params.wrap, "Wrap").changed();
+                });
+
+            e.checkbox(&mut ui.show_matrix_editor, "Matrix Editor")
+                .on_hover_text("M");
+
+            egui::CollapsingHeader::new("CPU stepping & timing")
+                .default_open(false)
+                .show(e, |e| {
+                e.label("CPU step mode");
+                e.horizontal(|e| {
+                    let is_auto = matches!(sim.params.cpu_step_mode, CpuStepMode::Auto);
+                    let is_naive = matches!(sim.params.cpu_step_mode, CpuStepMode::Naive);
+                    let is_grid = matches!(sim.params.cpu_step_mode, CpuStepMode::GridExact);
+
+                    if e.selectable_label(is_auto, "Auto").clicked() {
+                        sim.params.cpu_step_mode = CpuStepMode::Auto;
+                        changed = true;
+                    }
+                    if e.selectable_label(is_naive, "Naive").clicked() {
+                        sim.params.cpu_step_mode = CpuStepMode::Naive;
+                        changed = true;
+                    }
+                    if e.selectable_label(is_grid, "GridExact").clicked() {
+                        sim.params.cpu_step_mode = CpuStepMode::GridExact;
+                        changed = true;
+                    }
+                });
+
+                let mut auto_threshold = sim.params.auto_grid_threshold as u32;
+                if e.add(Slider::new(&mut auto_threshold, 0..=50_000).text("grid threshold"))
+                    .changed()
+                {
+                    sim.params.auto_grid_threshold = auto_threshold as usize;
+                    changed = true;
+                }
+
+                let resolved_mode = if sim.last_step_used_grid {
+                    "GridExact"
+                } else {
+                    "Naive"
+                };
+                e.label(format!("Last resolved mode: {}", resolved_mode));
+                e.label(format!("Neighbor checks: {}", sim.last_neighbor_checks));
+                e.label(format!("Grid resolution: {}", sim.last_grid_res));
+                e.label(format!("Last step time: {:.3} ms", sim.last_step_ms));
+                e.label(format!("Avg step time: {:.3} ms", sim.avg_step_ms));
+                });
 
             if changed {
                 sim.params_dirty = true;
             }
             e.separator();
 
-            e.label("Spawn");
-            e.horizontal(|e| {
-                if e.button("-1k").clicked() {
-                    let n = sim.particles.len().saturating_sub(1000);
-                    sim.particles.truncate(n);
-                    sim.particles_dirty = true;
-                }
-                if e.button("-100").clicked() {
-                    let n = sim.particles.len().saturating_sub(100);
-                    sim.particles.truncate(n);
-                    sim.particles_dirty = true;
-                }
-                if e.button("+100").clicked() {
-                    sim.spawn_random(100);
-                }
-                if e.button("+1k").clicked() {
-                    sim.spawn_random(1000);
-                }
-                if e.button("+10k").clicked() {
-                    sim.spawn_random(10000);
-                }
-            });
-            e.horizontal(|e| {
-                if e.button("Clear").clicked() {
-                    sim.clear_particles();
-                }
-                if e.button("🎲 Rules").clicked() {
-                    sim.randomize_rules();
-                }
-            });
+            egui::CollapsingHeader::new("Spawn")
+                .default_open(true)
+                .show(e, |e| {
+                crate::ui::spawn_ui::draw_spawn_panel(e, sim, ui);
+                e.horizontal(|e| {
+                    if e.button("🎲 Rules").clicked() {
+                        sim.randomize_rules();
+                        ui.flash("Rules randomized");
+                    }
+                });
+                });
             e.separator();
 
-            e.label("Camera");
-            let cam_label = if ui.camera_mode {
-                "🎥 Camera Mode  [ON]"
-            } else {
-                "🎥 Camera Mode [OFF]"
-            };
-            if e.button(cam_label).clicked() {
-                ui.camera_mode = !ui.camera_mode;
-                ui.mouse_look_active = false;
-            }
+            egui::CollapsingHeader::new("Camera")
+                .default_open(false)
+                .show(e, |e| {
+                let cam_label = if ui.camera_mode {
+                    "🎥 Camera Mode  [ON]"
+                } else {
+                    "🎥 Camera Mode [OFF]"
+                };
+                if e.button(cam_label).clicked() {
+                    ui.camera_mode = !ui.camera_mode;
+                    ui.mouse_look_active = false;
+                }
 
-            if ui.camera_mode {
-                e.add(
-                    Slider::new(&mut ui.fly_speed, 0.001..=50.0)
-                        .logarithmic(true)
-                        .text("fly speed"),
-                );
-                e.label("W/S = fwd/back  A/D = strafe\nQ/E = down/up   RMB drag = look");
-                if e.button("Reset pos").clicked() {
-                    ui.fly_pos = Vec3::new(
-                        sim.params.bounds * 0.5,
-                        sim.params.bounds * 0.5,
-                        sim.params.bounds * 2.0,
+                if ui.camera_mode {
+                    e.add(
+                        Slider::new(&mut ui.fly_speed, 0.001..=50.0)
+                            .logarithmic(true)
+                            .text("fly speed"),
                     );
-                    // Look at center from current position
-                    let center = Vec3::splat(sim.params.bounds * 0.5);
-                    let forward = (center - ui.fly_pos).normalize();
-                    ui.fly_yaw = forward.x.atan2(forward.z);
-                    ui.fly_pitch = forward.y.asin();
+                    e.label("W/S = fwd/back  A/D = strafe\nQ/E = down/up   RMB drag = look");
+                    if e.button("Reset pos").clicked() {
+                        ui.fly_pos = Vec3::new(
+                            sim.params.bounds * 0.5,
+                            sim.params.bounds * 0.5,
+                            sim.params.bounds * 2.0,
+                        );
+                        // Look at center from current position
+                        let center = Vec3::splat(sim.params.bounds * 0.5);
+                        let forward = (center - ui.fly_pos).normalize();
+                        ui.fly_yaw = forward.x.atan2(forward.z);
+                        ui.fly_pitch = forward.y.asin();
+                    }
+                    // Expose raw angles so player can nudge them precisely
+                    e.add(Slider::new(&mut ui.fly_yaw, -3.14..=3.14).text("yaw"));
+                    e.add(Slider::new(&mut ui.fly_pitch, -1.5..=1.5).text("pitch"));
                 }
-                // Expose raw angles so player can nudge them precisely
-                e.add(Slider::new(&mut ui.fly_yaw, -3.14..=3.14).text("yaw"));
-                e.add(Slider::new(&mut ui.fly_pitch, -1.5..=1.5).text("pitch"));
-            }
+                });
             e.separator();
 
-            e.label("Selection");
-            e.horizontal(|e| {
-                if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Rect), "Rect")
-                    .clicked()
-                {
-                    ui.selection_mode = SelectionMode::Rect;
-                }
-                if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Brush), "Brush")
-                    .clicked()
-                {
-                    ui.selection_mode = SelectionMode::Brush;
-                }
-                if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Slice), "Slice")
-                    .clicked()
-                {
-                    ui.selection_mode = SelectionMode::Slice;
-                }
-            });
-            if matches!(ui.selection_mode, SelectionMode::Slice) {
-                e.add(Slider::new(&mut ui.slice_center, -20.0..=20.0).text("slice center"));
-                e.add(Slider::new(&mut ui.slice_thickness, 0.001..=5.0).text("slice thickness"));
-            }
-            if matches!(ui.selection_mode, SelectionMode::Brush) {
-                e.add(Slider::new(&mut ui.brush_radius, 2.0..=300.0).text("brush radius"));
-            }
-
-            e.label(format!("{} selected", ui.selected_indices.len()));
-            if !ui.selected_indices.is_empty() {
+            egui::CollapsingHeader::new("Selection")
+                .default_open(false)
+                .show(e, |e| {
                 e.horizontal(|e| {
-                    if e.button("Clear sel").clicked() {
-                        ui.selected_indices.clear();
-                        ui.highlighted_indices.clear();
-                    }
-                    if e.button("Delete").clicked() {
-                        sim.delete_particles(&ui.selected_indices);
-                        ui.selected_indices.clear();
-                    }
-                    if e.button("Duplicate").clicked() {
-                        sim.duplicate_particles(&ui.selected_indices);
-                    }
-                });
-                e.horizontal(|e| {
-                    if e.button("Cool down").clicked() {
-                        sim.scale_velocities(0.1);
-                    }
-                    if e.button("Energy boost").clicked() {
-                        sim.scale_velocities(2.0);
-                    }
-                    if e.button("Freeze").clicked() {
-                        sim.scale_velocities(0.0);
-                    }
-                });
-                e.horizontal(|e| {
-                    e.label("Assign type:");
-                    let mut tv = ui.pending_assign_type as usize;
-                    if e.add(
-                        Slider::new(&mut tv, 0..=sim.params.type_count.saturating_sub(1)).text(""),
-                    )
-                    .changed()
+                    if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Rect), "Rect")
+                        .on_hover_text("1")
+                        .clicked()
                     {
-                        ui.pending_assign_type = tv as u32;
+                        ui.selection_mode = SelectionMode::Rect;
                     }
-                    if e.button("Assign").clicked() {
-                        sim.assign_type_to_particles(&ui.selected_indices, ui.pending_assign_type);
+                    if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Brush), "Brush")
+                        .on_hover_text("2")
+                        .clicked()
+                    {
+                        ui.selection_mode = SelectionMode::Brush;
+                    }
+                    if e.selectable_label(matches!(ui.selection_mode, SelectionMode::Slice), "Slice")
+                        .on_hover_text("3")
+                        .clicked()
+                    {
+                        ui.selection_mode = SelectionMode::Slice;
                     }
                 });
-            }
+                if matches!(ui.selection_mode, SelectionMode::Slice) {
+                    e.add(Slider::new(&mut ui.slice_center, -20.0..=20.0).text("slice center"));
+                    e.add(Slider::new(&mut ui.slice_thickness, 0.001..=5.0).text("slice thickness"));
+                }
+                if matches!(ui.selection_mode, SelectionMode::Brush) {
+                    e.add(Slider::new(&mut ui.brush_radius, 2.0..=300.0).text("brush radius"));
+                }
+
+                e.label(format!("{} selected", ui.selected_indices.len()));
+                if !ui.selected_indices.is_empty() {
+                    e.horizontal(|e| {
+                        if e.button("Clear sel").clicked() {
+                            ui.selected_indices.clear();
+                            ui.highlighted_indices.clear();
+                            ui.clear_selection_requested = true;
+                        }
+                        if e.button("Delete").clicked() {
+                            let count = ui.selected_indices.len();
+                            sim.delete_particles(&ui.selected_indices);
+                            ui.selected_indices.clear();
+                            // Indices shifted; stale GPU flags would highlight the
+                            // wrong particles.
+                            ui.clear_selection_requested = true;
+                            ui.flash(format!("Deleted {count} particles"));
+                        }
+                        if e.button("Duplicate").clicked() {
+                            sim.duplicate_particles(&ui.selected_indices);
+                            ui.flash(format!("Duplicated {} particles", ui.selected_indices.len()));
+                        }
+                    });
+                    e.horizontal(|e| {
+                        if e.button("Cool down").clicked() {
+                            sim.scale_velocities(0.1);
+                        }
+                        if e.button("Energy boost").clicked() {
+                            sim.scale_velocities(2.0);
+                        }
+                        if e.button("Freeze").clicked() {
+                            sim.scale_velocities(0.0);
+                        }
+                    });
+                    e.horizontal(|e| {
+                        e.label("Assign type:");
+                        let mut tv = ui.pending_assign_type as usize;
+                        if e.add(
+                            Slider::new(&mut tv, 0..=sim.params.type_count.saturating_sub(1)).text(""),
+                        )
+                        .changed()
+                        {
+                            ui.pending_assign_type = tv as u32;
+                        }
+                        if e.button("Assign").clicked() {
+                            sim.assign_type_to_particles(&ui.selected_indices, ui.pending_assign_type);
+                            ui.flash(format!(
+                                "Assigned T{} to {} particles",
+                                ui.pending_assign_type,
+                                ui.selected_indices.len()
+                            ));
+                        }
+                    });
+                }
+                });
             e.separator();
 
-            if e.button("📖 Creature Book").clicked() {
+            egui::CollapsingHeader::new("Profiles")
+                .default_open(false)
+                .show(e, |e| {
+                e.horizontal(|e| {
+                    if e.button("💾 Save profile").clicked() {
+                        ui.save_profile_now = true;
+                    }
+                    e.checkbox(&mut ui.auto_save_profiles, "auto-save");
+                });
+                if ui.auto_save_profiles {
+                    e.add(
+                        Slider::new(&mut ui.auto_save_interval, 100..=5000)
+                            .text("every N steps"),
+                    );
+                }
+                });
+            e.separator();
+
+            if e.button("📖 Creature Book").on_hover_text("B").clicked() {
                 ui.show_book = !ui.show_book;
             }
+            });
         });
 }
 
@@ -1122,18 +1383,11 @@ fn apply_force_preset(sim: &mut SimState, preset: &str) {
 // ── Matrix content functions ─────────────────────────────────────────────────────
 fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState, e: &mut egui::Ui) {
     let n = sim.params.type_count;
-    let dt = ctx.input(|i| i.stable_dt);
 
-    // Advance hold-click ramp (150 ms delay, then 1.0 unit/s)
-    if let Some((row, col, sign)) = ui.matrix_hold {
-        ui.matrix_hold_timer += dt;
-        if ui.matrix_hold_timer > 0.15 {
-            let val = sim.get_rule(row, col);
-            sim.set_rule(row, col, (val + sign * dt).clamp(-1.0, 1.0));
-        }
-    }
-
-    e.label("LMB = +  RMB = −  hold to ramp  scroll = fine");
+    e.label(
+        RichText::new("drag ↕ adjust · scroll fine · double-click zero · right-click flip sign")
+            .weak(),
+    );
     e.separator();
 
     // Enhanced controls row
@@ -1144,6 +1398,7 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                     sim.set_rule(i, j, 0.0);
                 }
             }
+            ui.flash("Force matrix zeroed");
         }
         if e.button("Symmetrize").clicked() {
             for i in 0..n {
@@ -1153,6 +1408,7 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                     sim.set_rule(j, i, avg);
                 }
             }
+            ui.flash("Symmetrized");
         }
         if e.button("Invert").clicked() {
             for i in 0..n {
@@ -1161,7 +1417,10 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                     sim.set_rule(i, j, -v);
                 }
             }
+            ui.flash("Inverted");
         }
+        e.checkbox(&mut ui.rules_symmetry, "mirror")
+            .on_hover_text("Edits apply to both (i,j) and (j,i)");
     });
 
     // Copy/Paste and Presets row
@@ -1174,6 +1433,7 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                 }
             }
             ui.force_clipboard = Some(matrix);
+            ui.flash("Force matrix copied");
         }
         if e.button("Paste").clicked() {
             if let Some(ref matrix) = ui.force_clipboard {
@@ -1183,6 +1443,9 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                             sim.set_rule(i, j, matrix[i * n + j]);
                         }
                     }
+                    ui.flash("Force matrix pasted");
+                } else {
+                    ui.flash("Clipboard is a different size");
                 }
             }
         }
@@ -1194,10 +1457,12 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                     sim.set_rule(i, j, rng.gen_range(-1.0..1.0));
                 }
             }
+            ui.flash("Force matrix randomized");
         }
-        e.checkbox(&mut ui.show_heat_map, "Heat Map");
         e.checkbox(&mut ui.show_matrix_stats, "Stats");
     });
+
+    // Audio modulation moved to its own tab (ActiveMatrixTab::Audio).
 
     // Presets dropdown
     e.horizontal(|e| {
@@ -1222,23 +1487,25 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
     });
     e.separator();
 
-    // Add scroll area so large matrices don't break window layout
-    if n > 16 {
-        e.colored_label(
-            Color32::YELLOW,
-            format!("Matrix hidden: {}x{} is too expensive for live UI. Reduce types or use presets/tools.", n, n)
-        );
-    } else {
-        egui::ScrollArea::both().show(e, |e| {
+    let hovered_last = ui.matrix_hovered_cell;
+    ui.matrix_hovered_cell = None;
+    let cell = effective_cell_size(ui.matrix_cell_size, n);
+    let show_text = cell >= 28.0;
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .drag_to_scroll(false) // cell drags adjust values, not scroll position
+        .max_height(560.0)
+        .show(e, |e| {
             Grid::new("matrix").spacing([2.0, 2.0]).show(e, |e| {
                 e.label("");
                 for col in 0..n {
-                    e.label(RichText::new(format!("T{}", col)).color(type_color_egui(col)));
+                    type_header(e, col, cell, hovered_last.map_or(false, |(_, c)| c == col));
                 }
                 e.end_row();
 
                 for row in 0..n {
-                    e.label(RichText::new(format!("T{}", row)).color(type_color_egui(row)));
+                    type_header(e, row, cell, hovered_last.map_or(false, |(r, _)| r == row));
 
                     for col in 0..n {
                         let val = sim.get_rule(row, col);
@@ -1251,50 +1518,57 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
                             Color32::from_rgb(40, 40, 40)
                         };
 
-                        let resp = e.add(
-                            egui::Button::new(RichText::new(format!("{:.2}", val)).size(11.0))
-                                .fill(cell_color)
-                                .min_size(egui::vec2(40.0, 28.0)),
+                        let resp = matrix_cell(
+                            e,
+                            cell,
+                            cell_color,
+                            show_text.then(|| format!("{:+.2}", val)),
+                            egui::Sense::click_and_drag(),
+                            false,
                         );
 
-                        // Single click: ±0.1
-                        if resp.clicked() {
-                            sim.set_rule(row, col, (val + 0.1).clamp(-1.0, 1.0));
+                        let mut new_val = val;
+                        let mut changed = false;
+
+                        // Drag vertically to adjust: 200 px covers the full range
+                        if resp.dragged() {
+                            new_val = (new_val - resp.drag_delta().y * 0.005).clamp(-1.0, 1.0);
+                            changed = new_val != val;
+                            e.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+                        }
+                        if resp.double_clicked() {
+                            new_val = 0.0;
+                            changed = true;
                         }
                         if resp.secondary_clicked() {
-                            sim.set_rule(row, col, (val - 0.1).clamp(-1.0, 1.0));
+                            new_val = -val;
+                            changed = val != 0.0;
                         }
-
-                        // Hold tracking
-                        if resp.is_pointer_button_down_on() {
-                            let sign = if ctx.input(|i| i.pointer.secondary_down()) {
-                                -1.0_f32
-                            } else {
-                                1.0_f32
-                            };
-                            if ui.matrix_hold != Some((row, col, sign)) {
-                                ui.matrix_hold = Some((row, col, sign));
-                                ui.matrix_hold_timer = 0.0;
-                            }
-                        } else if matches!(ui.matrix_hold, Some((r, c, _)) if r == row && c == col)
-                        {
-                            ui.matrix_hold = None;
-                            ui.matrix_hold_timer = 0.0;
-                        }
-
-                        // Scroll fine-tune
                         if resp.hovered() {
-                            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                            ui.matrix_hovered_cell = Some((row, col));
+                            // Consume scroll so fine-tuning doesn't also pan the ScrollArea
+                            let scroll = take_scroll(ctx);
                             if scroll != 0.0 {
-                                sim.set_rule(row, col, (val + scroll * 0.005).clamp(-1.0, 1.0));
+                                new_val = (new_val + scroll * 0.002).clamp(-1.0, 1.0);
+                                changed = true;
                             }
                         }
+
+                        if changed {
+                            sim.set_rule(row, col, new_val);
+                            if ui.rules_symmetry && row != col {
+                                sim.set_rule(col, row, new_val);
+                            }
+                        }
+
+                        resp.on_hover_text(format!(
+                            "T{row} → T{col}: {val:+.3}\ndrag ↕ adjust · scroll fine\ndouble-click zero · right-click flip sign"
+                        ));
                     }
                     e.end_row();
                 }
             });
         });
-    }
 
     e.separator();
 
@@ -1344,7 +1618,10 @@ fn draw_reaction_matrix_content(
     let n = sim.params.type_count;
     let _dt = ctx.input(|i| i.stable_dt);
 
-    e.label("LMB = cycle result  RMB = no reaction");
+    e.label(
+        RichText::new("pick a paint below · click/drag cells to paint · right-click erase · scroll cycle")
+            .weak(),
+    );
     e.separator();
 
     // Reaction controls
@@ -1355,9 +1632,11 @@ fn draw_reaction_matrix_content(
         }
         if e.button("Default").clicked() {
             sim.default_reaction_table();
+            ui.flash("Default reactions loaded");
         }
         if e.button("Clear").clicked() {
             sim.resize_reaction_table();
+            ui.flash("Reactions cleared");
         }
     });
 
@@ -1385,6 +1664,7 @@ fn draw_reaction_matrix_content(
                 }
             }
             ui.reaction_clipboard = Some(matrix);
+            ui.flash("Reaction table copied");
         }
         if e.button("Paste").clicked() {
             if let Some(ref matrix) = ui.reaction_clipboard {
@@ -1396,6 +1676,9 @@ fn draw_reaction_matrix_content(
                             }
                         }
                     });
+                    ui.flash("Reaction table pasted");
+                } else {
+                    ui.flash("Clipboard is a different size");
                 }
             }
         }
@@ -1409,6 +1692,7 @@ fn draw_reaction_matrix_content(
                     }
                 }
             });
+            ui.flash("Reaction table randomized");
         }
         e.checkbox(&mut ui.show_matrix_stats, "Stats");
     });
@@ -1463,80 +1747,118 @@ fn draw_reaction_matrix_content(
     }
     e.separator();
 
-    // Add scroll area so large matrices don't break window layout
-    if n > 16 {
-        e.colored_label(
-            Color32::YELLOW,
-            format!("Matrix hidden: {}x{} is too expensive for live UI. Reduce types or use presets/tools.", n, n)
-        );
-    } else {
-        egui::ScrollArea::both().show(e, |e| {
+    // Palette: choose what LMB paints
+    if ui.reaction_paint >= n as i32 {
+        ui.reaction_paint = -1;
+    }
+    e.horizontal_wrapped(|e| {
+        e.label("Paint:");
+        let resp = matrix_cell(
+            e,
+            26.0,
+            Color32::from_rgb(55, 55, 55),
+            Some("—".into()),
+            egui::Sense::click(),
+            ui.reaction_paint == -1,
+        )
+        .on_hover_text("Paint: no reaction");
+        if resp.clicked() {
+            ui.reaction_paint = -1;
+        }
+        for t in 0..n {
+            let resp = matrix_cell(
+                e,
+                26.0,
+                type_color_egui(t),
+                None,
+                egui::Sense::click(),
+                ui.reaction_paint == t as i32,
+            )
+            .on_hover_text(format!("Paint: T{t}"));
+            if resp.clicked() {
+                ui.reaction_paint = t as i32;
+            }
+        }
+    });
+    e.separator();
+
+    let hovered_last = ui.matrix_hovered_cell;
+    ui.matrix_hovered_cell = None;
+    let cell = effective_cell_size(ui.matrix_cell_size, n);
+    let show_text = cell >= 28.0;
+    let (pdown, sdown) = e.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .drag_to_scroll(false) // otherwise the ScrollArea eats the paint drag
+        .max_height(520.0)
+        .show(e, |e| {
             Grid::new("reaction_matrix")
                 .spacing([2.0, 2.0])
                 .show(e, |e| {
                     e.label("");
                     for col in 0..n {
-                        e.label(RichText::new(format!("T{}", col)).color(type_color_egui(col)));
+                        type_header(e, col, cell, hovered_last.map_or(false, |(_, c)| c == col));
                     }
                     e.end_row();
 
                     for row in 0..n {
-                        e.label(RichText::new(format!("T{}", row)).color(type_color_egui(row)));
+                        type_header(e, row, cell, hovered_last.map_or(false, |(r, _)| r == row));
 
                         for col in 0..n {
                             let val = sim.rx(row, col);
 
                             let cell_color = if val >= 0 {
-                                let result_type = val as usize;
-                                type_color_egui(result_type)
+                                type_color_egui(val as usize)
                             } else {
-                                Color32::from_rgb(60, 60, 60) // Dark gray for no reaction
+                                Color32::from_rgb(55, 55, 55) // no reaction
                             };
-
                             let display_text = if val >= 0 {
                                 format!("T{}", val)
                             } else {
                                 "—".to_string()
                             };
 
-                            let resp = e.add(
-                                egui::Button::new(RichText::new(display_text).size(11.0))
-                                    .fill(cell_color)
-                                    .min_size(egui::vec2(40.0, 28.0)),
+                            // Sense::hover so drag-painting sweeps across cells
+                            let resp = matrix_cell(
+                                e,
+                                cell,
+                                cell_color,
+                                show_text.then_some(display_text),
+                                egui::Sense::hover(),
+                                false,
                             );
 
-                            // LMB: cycle through reaction results
-                            if resp.clicked() {
-                                let current = sim.rx(row, col);
-                                let next = if current < 0 {
-                                    0
-                                } else {
-                                    (current + 1) % (n as i32)
-                                };
-                                sim.set_reaction(row, col, next);
-                            }
+                            // Rect hit-test, not resp.hovered(): hover is
+                            // suppressed for the whole duration of a press.
+                            if cell_hit(e, &resp) {
+                                ui.matrix_hovered_cell = Some((row, col));
 
-                            // RMB: set to -1 (no reaction)
-                            if resp.secondary_clicked() {
-                                sim.set_reaction(row, col, -1);
-                            }
+                                if pdown && val != ui.reaction_paint {
+                                    sim.set_reaction(row, col, ui.reaction_paint);
+                                } else if sdown && val != -1 {
+                                    sim.set_reaction(row, col, -1);
+                                }
 
-                            // Scroll fine-tune
-                            if resp.hovered() {
-                                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                                let scroll = take_scroll(ctx);
                                 if scroll != 0.0 {
-                                    let current = sim.rx(row, col);
-                                    let new_val = (current + scroll.signum() as i32)
+                                    let new_val = (val + scroll.signum() as i32)
                                         .clamp(-1, (n - 1) as i32);
                                     sim.set_reaction(row, col, new_val);
                                 }
                             }
+
+                            let result = if val >= 0 {
+                                format!("T{val}")
+                            } else {
+                                "no reaction".to_string()
+                            };
+                            resp.on_hover_text(format!("T{row} + T{col} → {result}"));
                         }
                         e.end_row();
                     }
                 });
         });
-    }
 
     e.separator();
     e.horizontal(|e| {
@@ -1546,7 +1868,7 @@ fn draw_reaction_matrix_content(
 }
 
 fn draw_trace_matrix_content(
-    ctx: &Context,
+    _ctx: &Context,
     sim: &mut SimState,
     ui: &mut UiState,
     e: &mut egui::Ui,
@@ -1555,7 +1877,7 @@ fn draw_trace_matrix_content(
 }
 
 fn apply_reaction_preset(sim: &mut SimState, preset: &str) {
-    let n = sim.params.type_count;
+    let _n = sim.params.type_count;
     match preset {
         "Rock-Paper-Scissors" => {
             sim.edit_reaction_table(|reaction_table, n| {
@@ -1783,3 +2105,5 @@ fn type_color_egui(kind: usize) -> Color32 {
     ];
     colors[kind % colors.len()]
 }
+
+

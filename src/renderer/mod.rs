@@ -62,26 +62,58 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Sync GPU selection with CPU selected_indices
-    pub fn sync_selection(&mut self, ui: &mut UiState) {
-        if ui.selection_readback_needed {
-            match self.compute.readback_selection(
-                &self.device,
-                &self.queue,
-                self.compute.particle_count,
-            ) {
-                Ok(selected_indices) => {
-                    ui.selected_indices = selected_indices;
-                    log::debug!(
-                        "GPU selection synced: {} particles selected",
-                        ui.selected_indices.len()
-                    );
-                }
-                Err(e) => {
-                    log::warn!("Failed to read back selection: {:?}", e);
+    /// Sync GPU selection flags into `ui.selected_indices`.
+    /// Also refreshes `sim.particles` from the GPU first (when GPU physics is
+    /// active) so that any CPU-side edit on the selection — delete, duplicate,
+    /// move, assign type — operates on current positions instead of snapping
+    /// the whole simulation back to a stale CPU copy.
+    pub fn sync_selection(&mut self, sim: &mut SimState, ui: &mut UiState) {
+        if !ui.selection_readback_needed {
+            return;
+        }
+        ui.selection_readback_needed = false;
+
+        if ui.use_gpu_physics {
+            self.sync_particles_from_gpu(sim);
+        }
+
+        match self.compute.readback_selection(
+            &self.device,
+            &self.queue,
+            self.compute.particle_count,
+        ) {
+            Ok(selected_indices) => {
+                ui.selected_indices = selected_indices;
+                log::debug!(
+                    "GPU selection synced: {} particles selected",
+                    ui.selected_indices.len()
+                );
+            }
+            Err(e) => {
+                log::warn!("Failed to read back selection: {:?}", e);
+            }
+        }
+    }
+
+    /// Refresh the CPU particle mirror from the current GPU buffer.
+    /// Preserves CPU-only fields (`prefab_local_type`) and does NOT set
+    /// `particles_dirty` — the GPU already has this exact data.
+    pub fn sync_particles_from_gpu(&mut self, sim: &mut SimState) {
+        if self.compute.particle_count == 0 {
+            return;
+        }
+        match self.compute.readback_particles(&self.device, &self.queue) {
+            Ok(gpu_particles) => {
+                for (p, g) in sim.particles.iter_mut().zip(gpu_particles.iter()) {
+                    p.position = g.position;
+                    p.velocity = g.velocity;
+                    p.kind = g.kind; // GPU reactions can change kind
+                    p.prefab_id = g.prefab_id;
                 }
             }
-            ui.selection_readback_needed = false; // Reset flag
+            Err(e) => {
+                log::warn!("Failed to read back particles: {:?}", e);
+            }
         }
     }
 
@@ -221,6 +253,21 @@ impl Renderer {
             pixels_per_point: window.scale_factor() as f32,
         };
 
+        // 0) Complete any pending selection readback from last frame, and keep
+        //    the CPU particle mirror fresh while a selection is being edited
+        //    under GPU physics. This runs BEFORE egui so the UI acts on
+        //    current data this frame. The blocking readback only happens while
+        //    a selection exists, not during normal simulation.
+        if ui.selection_readback_needed {
+            self.sync_selection(sim, ui);
+        } else if ui.use_gpu_physics
+            && !ui.paused
+            && !ui.selected_indices.is_empty()
+            && ui.drag_mode != crate::ui::DragMode::MovingSelection
+        {
+            self.sync_particles_from_gpu(sim);
+        }
+
         // 1) Run egui first so ui state is current for this frame
         let raw_input = self.egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -229,6 +276,15 @@ impl Renderer {
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
+
+        // Consume a pending "clear selection" request set by the UI this frame
+        // (new brush stroke, Clear button, or after a delete shifted indices).
+        // queue.write_buffer is ordered before the encoder submit, so the clear
+        // lands before this frame's selection dispatch.
+        if std::mem::take(&mut ui.clear_selection_requested) && self.compute.particle_count > 0 {
+            self.compute
+                .clear_selection(&self.queue, self.compute.particle_count);
+        }
 
         // 2) Upload dirty simulation data after UI may have changed it
         if sim.particles_dirty {
@@ -298,15 +354,20 @@ impl Renderer {
             sim.trace_len_matrix_dirty = false;
         }
 
-        // Upload GPU selection parameters
+        // Upload GPU selection parameters. Mouse coordinates from egui are in
+        // points, so the shader gets the viewport in points too. view_proj is
+        // last frame's camera (written by draw.rs), which is at most one frame
+        // stale — imperceptible for interactive selection.
+        ui.gpu_selection_params.view_proj = ui.view_proj.to_cols_array_2d();
+        ui.gpu_selection_params.viewport = [
+            self.surface_cfg.width as f32 / screen_desc.pixels_per_point,
+            self.surface_cfg.height as f32 / screen_desc.pixels_per_point,
+            0.0,
+            0.0,
+        ];
+        ui.gpu_selection_params.mode_flags[1] = self.compute.particle_count;
         self.compute
             .upload_selection_params(&self.queue, &ui.gpu_selection_params);
-
-        // Do not clear every frame. This is expensive at high particle counts.
-        // Clear only when selection mode changes, particles are reset, or user presses Clear Selection.
-        // if ui.gpu_selection_params.mode == 0 {
-        //     self.compute.clear_selection(&self.queue, self.compute.particle_count);
-        // }
 
         // 3) Sync UI state into compute trail parameters
         // Clear trail history when enabling trails mid-sim to avoid garbage
@@ -322,7 +383,7 @@ impl Renderer {
 
         self.compute.trails_enabled = trails_enabled;
         let trail_len_changed = ui.trace_len != self.compute.trail_len;
-        self.compute.trail_len = ui.trace_len.clamp(1, 20);
+        self.compute.trail_len = ui.trace_len.clamp(1, compute::MAX_TRAIL);
         if trail_len_changed {
             self.compute.reset_trails();
             self.compute
@@ -333,12 +394,20 @@ impl Renderer {
 
         // 4) GPU step - only when GPU physics is enabled
         if ui.use_gpu_physics && (!ui.paused || ui.step_once) {
-            self.compute
-                .dispatch(&mut encoder, self.compute.particle_count);
+            // Strobe: two sim steps per rendered frame so period-2 oscillating
+            // objects appear frozen (trails also capture stroboscopically). A
+            // manual Step while paused advances one step, flipping the phase.
+            let steps = if ui.strobe && !ui.paused { 2 } else { 1 };
+            for _ in 0..steps {
+                self.compute
+                    .dispatch(&mut encoder, self.compute.particle_count);
 
-            // Swap ping-pong buffers after compute completes
-            self.compute.swap_particle_buffers();
-            
+                // Swap ping-pong buffers after compute completes
+                self.compute.swap_particle_buffers();
+
+                sim.step_count += 1;
+            }
+
             // Update trail capture bind group to use the current particle buffer
             self.compute.update_trail_capture_bind_group(&self.device);
 
@@ -352,7 +421,6 @@ impl Renderer {
                 self.compute.upload_trail_params(&self.queue, ui.trace_trigger_only);
             }
 
-            sim.step_count += 1;
             ui.step_once = false;
 
             // Debug output - print trail state once per second (roughly)
@@ -376,7 +444,11 @@ impl Renderer {
             }
         }
 
-        // 5) GPU selection is handled in compute shader - no readback needed
+        // 5) Selection pass — dedicated compute pass against the current
+        //    particle buffer. Runs regardless of pause state or physics
+        //    backend; internally a no-op when no selection tool is active.
+        self.compute
+            .dispatch_selection(&mut encoder, ui.gpu_selection_params.mode_flags[0]);
 
         // 6) Draw world — always render directly to swapchain with hard clear
         let load_op = wgpu::LoadOp::Clear(wgpu::Color {
@@ -445,11 +517,6 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
-
-    /// GPU selection eliminates need for CPU readback
-    #[allow(dead_code)]
-    pub fn complete_readback(&mut self, _sim: &mut SimState) -> Result<(), wgpu::BufferAsyncError> {
-        // No-op - GPU selection handles everything
-        Ok(())
-    }
 }
+
+

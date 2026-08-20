@@ -1,3 +1,4 @@
+mod audio;
 mod crash_profile;
 mod renderer;
 mod selection;
@@ -95,22 +96,42 @@ fn main() {
                                     // GPU physics is handled in the renderer
                                     // step_count will be incremented there
                                 } else {
-                                    // CPU physics
-                                    sim.step();
+                                    // CPU physics. Strobe runs two sim steps per
+                                    // rendered frame so period-2 oscillating
+                                    // objects appear frozen; a manual Step while
+                                    // paused advances one step (flips the phase).
+                                    let steps = if ui.strobe && !ui.paused { 2 } else { 1 };
+                                    for _ in 0..steps {
+                                        sim.step();
+                                    }
                                     sim.particles_dirty = true;
                                 }
                             }
 
-                            // TEMP DISABLED: GPU readback stalls the frame hard.
-                            // Only re-enable when selection actually needs CPU-side selected_indices.
-                            // if ui.selection_readback_needed && !ui.is_selecting {
-                            //     renderer.sync_selection(&mut ui);
-                            // }
-
+                            // Selection readback + CPU/GPU particle sync are
+                            // handled inside renderer.render (once per
+                            // selection gesture, not per frame).
                             renderer.render(&window, &mut sim, &mut ui);
 
                             // Flush book saving if dirty (deferred I/O to avoid blocking UI)
                             sim.book.flush_if_dirty();
+
+                            // ── Profiles ────────────────────────────────────
+                            if std::mem::take(&mut ui.save_profile_now) {
+                                crash_profile::save_crash_profile(&sim, &ui);
+                                ui.flash("Profile saved");
+                                log::info!(
+                                    "profile saved to {:?}",
+                                    crash_profile::crash_profile_path()
+                                );
+                            }
+                            if ui.auto_save_profiles
+                                && should_step
+                                && sim.step_count > 0
+                                && sim.step_count % ui.auto_save_interval as u64 == 0
+                            {
+                                crash_profile::save_crash_profile(&sim, &ui);
+                            }
                         }
 
                         _ => {}
@@ -132,3 +153,6 @@ fn main() {
         })
         .unwrap();
 }
+
+
+

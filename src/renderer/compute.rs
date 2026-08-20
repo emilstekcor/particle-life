@@ -3,6 +3,10 @@ use std::mem;
 
 pub const MAX_TYPES: usize = 32;
 
+/// Maximum trail history length. The trail history buffer is allocated for
+/// this many points per particle, so every slider/clamp must agree with it.
+pub const MAX_TRAIL: u32 = 20;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuParams {
@@ -27,12 +31,25 @@ pub struct GpuParams {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SelectionParams {
-    pub mode_flags: [u32; 4],     // mode + 3 flags/padding
-    
-    pub rect_min: [f32; 4],       // rect_min + padding
-    pub rect_max: [f32; 4],       // rect_max + padding
-    
-    pub brush_data: [f32; 4],     // brush_center.x, brush_center.y, brush_radius, slice_depth
+    pub view_proj: [[f32; 4]; 4], // camera view-projection (world -> clip)
+    pub mode_flags: [u32; 4],     // x = mode (0 none, 1 rect, 2 brush, 3 slice), y = particle count
+    pub rect_min: [f32; 4],       // xy = rect min in egui points
+    pub rect_max: [f32; 4],       // xy = rect max in egui points
+    pub brush_data: [f32; 4],     // rect/brush: xy center + z radius (points); slice: z thickness + w center (world)
+    pub viewport: [f32; 4],       // xy = viewport size in egui points
+}
+
+impl Default for SelectionParams {
+    fn default() -> Self {
+        Self {
+            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            mode_flags: [0; 4],
+            rect_min: [0.0; 4],
+            rect_max: [0.0; 4],
+            brush_data: [0.0; 4],
+            viewport: [1.0, 1.0, 0.0, 0.0],
+        }
+    }
 }
 
 #[repr(C)]
@@ -59,6 +76,12 @@ impl From<&SimParams> for GpuParams {
     fn from(params: &SimParams) -> Self {
         Self {
             dt: params.dt,
+            // INTENTIONAL MISMATCH: the GPU uses raw parameter values while
+            // CPU physics uses the bounds-scaled variants (scaled_r_max etc).
+            // The period-2 oscillating "objects" this project studies are
+            // tuned per-backend on a floating-point knife edge; changing
+            // either side's units silently breaks every saved configuration.
+            // Unify only with an explicit migration of saved params.
             r_max: params.r_max,
             force_scale: params.force_scale,
             friction: params.friction,
@@ -95,7 +118,11 @@ pub struct ComputePipeline {
     pub trace_prev_pos_buf: wgpu::Buffer, // trace previous positions (vec3 per particle)
     pub selection_buf: wgpu::Buffer, // selection flags (1 byte per particle)
     selection_params_buf: wgpu::Buffer, // selection parameters
-    readback_buf: wgpu::Buffer,      // staging buffer for GPU->CPU readback
+    readback_buf: wgpu::Buffer,      // staging buffer for GPU->CPU particle readback
+
+    // Dedicated selection pass (runs even while paused; see selection.wgsl)
+    selection_pipeline: wgpu::ComputePipeline,
+    selection_bind_groups: [wgpu::BindGroup; 2],
 
     // Trail system
     pub trail_history_buf: wgpu::Buffer,
@@ -326,7 +353,9 @@ impl ComputePipeline {
         let selection_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Selection Buffer"),
             size: (max_particles * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE   // selection.wgsl writes flags
+                | wgpu::BufferUsages::COPY_DST   // clear_selection zeroes it
+                | wgpu::BufferUsages::COPY_SRC,  // readback_selection copies out
             mapped_at_creation: false,
         });
 
@@ -346,14 +375,95 @@ impl ComputePipeline {
             mapped_at_creation: false,
         });
 
-        // Create trail buffers
-        // Keep default within GPU buffer limits (safe for large particle counts)
-        const DEFAULT_TRAIL_LEN: u32 = 20;
-        let trail_len = DEFAULT_TRAIL_LEN;
+        // ── Dedicated selection pass ───────────────────────────────────────────
+        let selection_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Selection Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/selection.wgsl").into()),
+        });
+
+        let selection_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Selection BGL"),
+                entries: &[
+                    // Particles (read)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Selection flags (read_write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Selection params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let selection_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Selection Pipeline Layout"),
+                bind_group_layouts: &[&selection_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let selection_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Selection Pipeline"),
+                layout: Some(&selection_pipeline_layout),
+                module: &selection_shader,
+                entry_point: "main",
+            });
+
+        // One bind group per particle buffer so the pass always reads whichever
+        // buffer currently holds the freshest particle data.
+        let selection_bind_groups = [0usize, 1usize].map(|idx| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Selection Bind Group"),
+                layout: &selection_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[idx].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: selection_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: selection_params_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        });
+
+        // Create trail buffers, sized for the maximum trail length
         let trail_history_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Trail History Buffer"),
             size: (max_particles as u64)
-                * (trail_len as u64)
+                * (MAX_TRAIL as u64)
                 * (std::mem::size_of::<TrailPoint>() as u64),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -573,6 +683,8 @@ impl ComputePipeline {
             selection_buf,
             selection_params_buf,
             readback_buf,
+            selection_pipeline,
+            selection_bind_groups,
             trail_history_buf,
             trail_params_buf,
             trail_capture_pipeline,
@@ -611,6 +723,68 @@ impl ComputePipeline {
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, self.current_compute_bind_group(), &[]);
         cpass.dispatch_workgroups(workgroups, 1, 1);
+    }
+
+    /// Run the dedicated selection pass against the current particle buffer.
+    /// `mode` is SelectionParams::mode_flags[0]; pass it so we can skip the
+    /// dispatch entirely when no selection tool is active (mode 0 preserves
+    /// the existing flags).
+    pub fn dispatch_selection(&self, encoder: &mut wgpu::CommandEncoder, mode: u32) {
+        if mode == 0 || self.particle_count == 0 {
+            return;
+        }
+        let workgroups = (self.particle_count + 63) / 64;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Selection Pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.selection_pipeline);
+        cpass.set_bind_group(0, &self.selection_bind_groups[self.particle_read_index], &[]);
+        cpass.dispatch_workgroups(workgroups, 1, 1);
+    }
+
+    /// Read the current particle buffer back to the CPU.
+    /// Blocking, so only call this while the user is actively editing a
+    /// selection — it's what keeps `sim.particles` from going stale (and
+    /// snapping the sim backwards) when GPU physics owns the positions.
+    pub fn readback_particles(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<GpuParticle>, wgpu::BufferAsyncError> {
+        if self.particle_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let bytes = (self.particle_count as usize * mem::size_of::<GpuParticle>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Particle Readback Copy"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &self.particle_buffers[self.particle_read_index],
+            0,
+            &self.readback_buf,
+            0,
+            bytes,
+        );
+        queue.submit([encoder.finish()]);
+        device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = self.readback_buf.slice(0..bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap()?;
+
+        let data = buffer_slice.get_mapped_range();
+        let particles: Vec<GpuParticle> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        self.readback_buf.unmap();
+
+        Ok(particles)
     }
 
     pub fn upload_particles(&mut self, queue: &wgpu::Queue, particles: &[GpuParticle]) {
@@ -725,10 +899,12 @@ impl ComputePipeline {
         let buffer_slice = staging_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            let _ = tx.send(result);
         });
 
-        // Wait for the mapping to complete
+        // The map callback only fires while the device is polled — without
+        // this, recv() below blocks forever.
+        device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap()?;
 
         // Read the selection data
@@ -833,3 +1009,6 @@ impl ComputePipeline {
         encoder.clear_buffer(&self.trail_history_buf, 0, Some(size));
     }
 }
+
+
+

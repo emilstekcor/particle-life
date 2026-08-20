@@ -240,7 +240,35 @@ impl SimState {
             .collect();
         self.force_matrix_dirty = true;
     }
+    pub fn respawn_mix(&mut self, mix: &[usize]) -> usize {
+        use rand::Rng;
+        let cap = MAX_RENDER_PARTICLES.min(MAX_CPU_PHYSICS_PARTICLES);
+        let n = self.params.type_count;
 
+        self.particles.clear();
+        let mut rng = rand::thread_rng();
+        let mut total = 0usize;
+
+        for (kind, &count) in mix.iter().enumerate().take(n) {
+            for _ in 0..count {
+                if total >= cap {
+                    log::warn!("Particle cap reached during respawn ({cap})");
+                    self.particles_dirty = true;
+                    return total;
+                }
+                let pos = glam::Vec3::new(
+                    rng.gen_range(0.0..self.params.bounds),
+                                          rng.gen_range(0.0..self.params.bounds),
+                                          rng.gen_range(0.0..self.params.bounds),
+                );
+                self.particles.push(Particle::new(pos, kind as u32));
+                total += 1;
+            }
+        }
+
+        self.particles_dirty = true;
+        total
+    }
     pub fn get_rule(&self, a: usize, b: usize) -> f32 {
         self.force_matrix[a * self.params.type_count + b]
     }

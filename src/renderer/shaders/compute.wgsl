@@ -24,21 +24,14 @@ struct Params {
     _pad2:                u32,
 };
 
-struct SelectionParams {
-    mode_flags: vec4<u32>,      // mode + 3 flags/padding
-    
-    rect_min: vec4<f32>,        // rect_min + padding
-    rect_max: vec4<f32>,        // rect_max + padding
-    
-    brush_data: vec4<f32>,      // brush_center.x, brush_center.y, brush_radius, slice_depth
-};
+// Selection is handled by a dedicated compute pass (selection.wgsl) so it
+// works while paused and doesn't get wiped by the physics kernel.
+// Bindings 4/5 remain reserved in the Rust bind group layout.
 
 @group(0) @binding(0) var<storage, read>  particles_in:  array<Particle>;
 @group(0) @binding(1) var<storage, read_write> particles_out: array<Particle>;
 @group(0) @binding(2) var<uniform>             params:    Params;
 @group(0) @binding(3) var<storage, read>       rules:     array<f32>;
-@group(0) @binding(4) var<storage, read_write> selection: array<u32>;
-@group(0) @binding(5) var<uniform>             sel_params: SelectionParams;
 @group(0) @binding(6) var<storage, read>       reaction_table: array<i32>;
 @group(0) @binding(7) var<storage, read>       trace_len_matrix: array<u32>;
 @group(0) @binding(8) var<storage, read_write> trace_timers: array<u32>;
@@ -56,26 +49,6 @@ fn force_law(dn: f32, attr: f32, beta: f32) -> f32 {
         return dn / beta - 1.0;
     }
     return attr * (1.0 - abs((2.0 * dn - 1.0 - beta) / (1.0 - beta)));
-}
-
-fn check_selection(pos: vec3<f32>, sel: SelectionParams) -> bool {
-    if sel.mode_flags[0] == 0u {
-        return false;
-    }
-    
-    if sel.mode_flags[0] == 1u { // Rectangle selection
-        let screen_pos = pos.xy;
-        return screen_pos.x >= sel.rect_min.x && screen_pos.x <= sel.rect_max.x &&
-               screen_pos.y >= sel.rect_min.y && screen_pos.y <= sel.rect_max.y;
-    } else if sel.mode_flags[0] == 2u { // Brush selection
-        let screen_pos = pos.xy;
-        let dist = distance(screen_pos, sel.brush_data.xy);
-        return dist <= sel.brush_data[2];
-    } else if sel.mode_flags[0] == 3u { // Slice selection
-        return pos.z <= sel.brush_data[3];
-    }
-    
-    return false;
 }
 
 @compute @workgroup_size(64)
@@ -183,12 +156,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pi.prefab_id
     );
     
-    // Update selection
-    let is_selected = check_selection(pos, sel_params);
-    selection[i] = u32(is_selected);
-    
     // Decrement trace timer
     if trace_timers[i] > 0u {
         trace_timers[i] = trace_timers[i] - 1u;
     }
 }
+
+
