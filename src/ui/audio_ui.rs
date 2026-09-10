@@ -106,7 +106,11 @@ fn draw_source(
 
 fn draw_transport(e: &mut egui::Ui, audio: &mut AudioMod) {
     e.horizontal(|e| {
-        let label = if audio.playing { "⏸ Pause" } else { "▶ Play" };
+        let label = if audio.playing {
+            "⏸ Pause"
+        } else {
+            "▶ Play"
+        };
         if e.button(label).clicked() {
             audio.toggle_play();
         }
@@ -125,13 +129,12 @@ fn draw_transport(e: &mut egui::Ui, audio: &mut AudioMod) {
         let dur = audio.duration_secs();
         let mut pos = audio.position_secs();
         e.label(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
-        if e
-            .add(
-                egui::Slider::new(&mut pos, 0.0..=dur.max(0.01))
-                    .show_value(false)
-                    .text(""),
-            )
-            .drag_released()
+        if e.add(
+            egui::Slider::new(&mut pos, 0.0..=dur.max(0.01))
+                .show_value(false)
+                .text(""),
+        )
+        .drag_stopped()
         {
             audio.seek_secs(pos);
         }
@@ -239,12 +242,7 @@ fn draw_base_readout(e: &mut egui::Ui, audio: &AudioMod, n: usize) {
 // ── Band meters ─────────────────────────────────────────────────────────────
 
 /// Meters double as the channel picker — click one to add that band.
-fn draw_band_strip(
-    e: &mut egui::Ui,
-    audio: &mut AudioMod,
-    n: usize,
-    status: &mut Option<String>,
-) {
+fn draw_band_strip(e: &mut egui::Ui, audio: &mut AudioMod, n: usize, status: &mut Option<String>) {
     e.horizontal(|e| {
         e.label(RichText::new("bands").weak());
         e.label(
@@ -270,13 +268,7 @@ fn draw_band_strip(
     }
 }
 
-fn draw_band_meter(
-    e: &mut egui::Ui,
-    v: f32,
-    name: &str,
-    idx: usize,
-    used: bool,
-) -> egui::Response {
+fn draw_band_meter(e: &mut egui::Ui, v: f32, name: &str, idx: usize, used: bool) -> egui::Response {
     let w = 26.0;
     let h = 54.0;
     let (rect, resp) = e.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
@@ -288,9 +280,17 @@ fn draw_band_meter(
             egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - fill_h), rect.max);
         p.rect_filled(fill_rect, 3.0, band_color(idx));
         if used {
-            p.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, Color32::from_gray(210)));
+            p.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.5_f32, Color32::from_gray(210)),
+            );
         } else if resp.hovered() {
-            p.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, Color32::from_gray(140)));
+            p.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0_f32, Color32::from_gray(140)),
+            );
         }
     }
     let tip = if used {
@@ -342,8 +342,7 @@ fn draw_channels(
                 }
             });
 
-        if e
-            .button("auto-fill")
+        if e.button("auto-fill")
             .on_hover_text(
                 "One channel per band, each seeded with an alternating-sign\n\
                  off-diagonal pattern. A starting point, not a preset.",
@@ -385,7 +384,7 @@ fn draw_channels(
                 let tint = band_color(band);
 
                 egui::Frame::group(e.style())
-                    .stroke(egui::Stroke::new(1.0, tint.gamma_multiply(0.55)))
+                    .stroke(egui::Stroke::new(1.0_f32, tint.gamma_multiply(0.55)))
                     .show(e, |e| {
                         // ── Header ──────────────────────────────────────────
                         e.horizontal(|e| {
@@ -415,18 +414,17 @@ fn draw_channels(
                                     .small(),
                             );
 
-                            e.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |e| {
-                                    if e.button("🗑").on_hover_text("Remove channel").clicked() {
-                                        remove = Some(li);
-                                    }
-                                    if e.button("zero").on_hover_text("Clear this matrix").clicked()
-                                    {
-                                        layer.clear();
-                                    }
-                                },
-                            );
+                            e.with_layout(egui::Layout::right_to_left(egui::Align::Center), |e| {
+                                if e.button("🗑").on_hover_text("Remove channel").clicked() {
+                                    remove = Some(li);
+                                }
+                                if e.button("zero")
+                                    .on_hover_text("Clear this matrix")
+                                    .clicked()
+                                {
+                                    layer.clear();
+                                }
+                            });
                         });
 
                         if !audio.layers[li].open {
@@ -439,8 +437,7 @@ fn draw_channels(
 
                             e.label(RichText::new("drives").weak().small());
                             for t in LayerTarget::ALL {
-                                if e
-                                    .selectable_label(layer.target == t, t.label())
+                                if e.selectable_label(layer.target == t, t.label())
                                     .on_hover_text(t.hover())
                                     .clicked()
                                     && layer.target != t
@@ -463,8 +460,7 @@ fn draw_channels(
                             if layer.target == LayerTarget::Force {
                                 e.label(RichText::new("combine").weak().small());
                                 for m in CombineMode::ALL {
-                                    if e
-                                        .selectable_label(layer.combine == m, m.label())
+                                    if e.selectable_label(layer.combine == m, m.label())
                                         .on_hover_text(m.hover())
                                         .clicked()
                                     {
@@ -476,8 +472,7 @@ fn draw_channels(
 
                             e.label(RichText::new("swing").weak().small());
                             for m in SwingMode::ALL {
-                                if e
-                                    .selectable_label(layer.swing == m, m.label())
+                                if e.selectable_label(layer.swing == m, m.label())
                                     .on_hover_text(m.hover())
                                     .clicked()
                                 {
@@ -564,8 +559,7 @@ fn draw_channels(
                                         e,
                                         col,
                                         cell,
-                                        hovered_last
-                                            .map_or(false, |(l, _, c)| l == li && c == col),
+                                        hovered_last.map_or(false, |(l, _, c)| l == li && c == col),
                                     );
                                 }
                                 e.end_row();
@@ -575,8 +569,7 @@ fn draw_channels(
                                         e,
                                         row,
                                         cell,
-                                        hovered_last
-                                            .map_or(false, |(l, r, _)| l == li && r == row),
+                                        hovered_last.map_or(false, |(l, r, _)| l == li && r == row),
                                     );
 
                                     for col in 0..n {
@@ -627,8 +620,7 @@ fn draw_channels(
                                         let mut changed = false;
 
                                         if resp.dragged() {
-                                            new_val = (new_val
-                                                - resp.drag_delta().y * 0.005)
+                                            new_val = (new_val - resp.drag_delta().y * 0.005)
                                                 .clamp(-1.0, 1.0);
                                             changed = new_val != val;
                                             e.output_mut(|o| {
@@ -647,8 +639,8 @@ fn draw_channels(
                                             hovered_now = Some((li, row, col));
                                             let scroll = take_scroll(ctx);
                                             if scroll != 0.0 {
-                                                new_val = (new_val + scroll * 0.002)
-                                                    .clamp(-1.0, 1.0);
+                                                new_val =
+                                                    (new_val + scroll * 0.002).clamp(-1.0, 1.0);
                                                 changed = true;
                                             }
                                         }
@@ -698,7 +690,12 @@ fn draw_channels(
         *status = Some(format!("Removed {} channel", BAND_NAMES[band]));
     }
 
-    if audio.armed && audio.layers.iter().all(|l| !l.enabled || l.active_cells() == 0) {
+    if audio.armed
+        && audio
+            .layers
+            .iter()
+            .all(|l| !l.enabled || l.active_cells() == 0)
+    {
         e.colored_label(
             Color32::from_rgb(210, 180, 90),
             "Armed but every channel is empty or disabled — nothing will move.",

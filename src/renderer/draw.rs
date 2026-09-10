@@ -6,44 +6,16 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
-impl Vertex {
-    fn new(pos: Vec3, kind: u32) -> Self {
-        let colors = [
-            [0.96, 0.36, 0.36],
-            [0.36, 0.76, 0.96],
-            [0.56, 0.96, 0.36],
-            [0.96, 0.76, 0.26],
-            [0.86, 0.46, 0.96],
-            [0.96, 0.56, 0.26],
-            [0.36, 0.96, 0.76],
-            [0.96, 0.76, 0.86],
-        ];
-        Self {
-            position: pos.into(),
-            color: colors[kind as usize % colors.len()],
-        }
-    }
-
-    fn with_color(pos: Vec3, color: [f32; 3]) -> Self {
-        Self {
-            position: pos.into(),
-            color,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
+pub struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     particle_size: f32,
-    _padding: f32,
+    render_data: [f32; 4], // x = soft edges
+    slice_centers: [f32; crate::sim::MAX_DIM],
+    slice_thickness: [f32; crate::sim::MAX_DIM],
+    dimension_data: [u32; 4],
+    projection: [[f32; 4]; 16],
+    projection_data: [f32; 4],
 }
 
 pub struct DrawPipeline {
@@ -113,17 +85,25 @@ impl DrawPipeline {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<crate::sim::GpuParticle>()
                         as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
+                    // Instance, not Vertex: each particle is now expanded into a
+                    // 6-vertex billboard quad so particle_size can do anything.
+                    // PointList had no size — WebGPU has no gl_PointSize.
+                    step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
                         wgpu::VertexAttribute {
                             offset: 0,
                             shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x3,
+                            format: wgpu::VertexFormat::Float32x4,
                         },
                         wgpu::VertexAttribute {
-                            offset: 12,
+                            offset: (crate::sim::MAX_DIM * std::mem::size_of::<f32>()) as u64,
                             shader_location: 1,
                             format: wgpu::VertexFormat::Uint32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: (4 * std::mem::size_of::<f32>()) as u64,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32x4,
                         },
                     ],
                 }],
@@ -133,12 +113,16 @@ impl DrawPipeline {
                 entry_point: "main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_cfg.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // Alpha blending is required for soft edges. In hard-edge
+                    // mode the shader writes alpha = 1.0, which makes this
+                    // behave exactly like REPLACE — so both modes share one
+                    // pipeline and neither is order-dependent.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::PointList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -473,8 +457,7 @@ impl DrawPipeline {
         particle_target: &wgpu::TextureView, // Target for particle rendering (trace texture or swapchain)
         sim: &crate::sim::SimState,
     ) {
-        let (uniform, view_matrix, view_proj) =
-            self.build_camera(ui, screen_desc, sim.params.particle_size);
+        let (uniform, view_matrix, view_proj) = self.build_camera(ui, screen_desc, sim);
         ui.view_matrix = view_matrix;
         ui.view_proj = view_proj;
         ui.viewport = screen_desc.size_in_pixels;
@@ -514,7 +497,6 @@ impl DrawPipeline {
         // Draw trails based on render mode
         match ui.trace_render_mode {
             crate::ui::TraceRenderMode::Off => {}
-            crate::ui::TraceRenderMode::Simple => {} // Removed - no longer used
             crate::ui::TraceRenderMode::Lines => {
                 if particle_count > 0 && trail_valid_len >= 2 {
                     // Debug mode: cap to first 32 particles for easier inspection
@@ -565,15 +547,16 @@ impl DrawPipeline {
         rp.set_vertex_buffer(0, particle_buf.slice(..));
 
         if particle_count > 0 {
-            rp.draw(0..particle_count, 0..1);
+            // 6 vertices (two triangles) per instance, one instance per particle.
+            rp.draw(0..6, 0..particle_count);
         }
     }
 
-    fn build_camera(
+    pub fn build_camera(
         &self,
         ui: &UiState,
         screen_desc: &ScreenDescriptor,
-        particle_size: f32,
+        sim: &crate::sim::SimState,
     ) -> (CameraUniform, Mat4, Mat4) {
         let pos = ui.fly_pos;
         let target = pos + ui.fly_forward();
@@ -592,9 +575,27 @@ impl DrawPipeline {
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
             camera_pos: pos.to_array(),
-            particle_size: particle_size,
-            _padding: 0.0,
+            particle_size: sim.params.particle_size,
+            render_data: [if ui.soft_particles { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            slice_centers: ui.extra_slice_centers,
+            slice_thickness: ui.extra_slice_thickness,
+            dimension_data: [sim.params.dimension as u32, 0, 0, 0],
+            projection: ui.nd.packed(sim.params.dimension),
+            projection_data: [
+                sim.params.bounds * 0.5,
+                if sim.params.wrap { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
         (uniform, view, view_proj)
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[test]
+    fn camera_uniform_matches_wgsl() {
+        assert_eq!(std::mem::size_of::<super::CameraUniform>(), 448);
     }
 }

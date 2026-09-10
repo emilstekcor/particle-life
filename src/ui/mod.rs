@@ -2,16 +2,23 @@ pub mod audio_ui;
 pub mod spawn_ui;
 
 use crate::audio::AudioMod;
-use crate::sim::{CpuStepMode, SimState};
+use crate::sim::{CpuStepMode, SimState, VecNd, MAX_DIM, MAX_TYPES, MIN_DIM};
 use egui::{Color32, Context, Grid, RichText, Slider};
 use glam::Vec3;
 
 // ── UiState ───────────────────────────────────────────────────────────────────
 pub struct UiState {
+    pub nd: crate::multidim::ViewNd,
+    pub session: crate::session::SessionUi,
+    pub playback: crate::session::Playback,
     pub paused: bool,
     pub step_once: bool,
     pub use_gpu_physics: bool,
     pub cap_to_bounds: bool,
+    /// Antialiased particle edges. Off by default: hard edges are fully
+    /// order-independent, so overlapping particles can't flicker between frames
+    /// in a way the physics didn't produce.
+    pub soft_particles: bool,
 
     // ── Free-fly camera ───────────────────────────────────────────────────────
     pub fly_pos: Vec3,
@@ -47,14 +54,18 @@ pub struct UiState {
     pub view_matrix: glam::Mat4,
     pub slice_center: f32,
     pub slice_thickness: f32,
+    pub extra_slice_centers: [f32; MAX_DIM],
+    pub extra_slice_thickness: [f32; MAX_DIM],
+    pub pending_dimension: Option<usize>,
     pub move_start_mouse: Option<egui::Pos2>,
-    pub move_start_positions: Vec<[f32; 3]>,
+    pub move_start_positions: Vec<VecNd>,
     pub pending_assign_type: u32,
 
     // ── Rule matrix hold-click state ──────────────────────────────────────────
 
     // ── Trail/trace state ───────────────────────────────────────────────────────
     pub trace_len: u32,
+    pub trace_len_limit: u32,
     pub trace_fade_alpha: f32,
     pub trace_render_mode: TraceRenderMode,
     pub trace_type_filter: i32,
@@ -76,7 +87,7 @@ pub struct UiState {
     pub force_presets: Vec<String>,
     pub reaction_presets: Vec<String>,
     pub active_matrix_tab: ActiveMatrixTab,
-    
+
     // Profile fields
     pub save_profile_now: bool,
     pub auto_save_profiles: bool,
@@ -87,15 +98,15 @@ pub struct UiState {
     pub clear_selection_requested: bool,
 
     // ── UX state ────────────────────────────────────────────────────────────
-    pub matrix_cell_size: f32,               // shared cell size for all matrix tabs
-    pub rules_symmetry: bool,                // mirror edits across the force-matrix diagonal
-    pub reaction_paint: i32,                 // palette selection for the reaction tab (-1 = no reaction)
+    pub matrix_cell_size: f32, // shared cell size for all matrix tabs
+    pub rules_symmetry: bool,  // mirror edits across the force-matrix diagonal
+    pub reaction_paint: i32,   // palette selection for the reaction tab (-1 = no reaction)
     pub matrix_hovered_cell: Option<(usize, usize)>, // last frame's hovered cell (row/col cross-highlight)
-    pub trace_last_painted: Option<(usize, usize)>,  // stroke tracking so Add/Mult brushes fire once per cell
-    pub status: Option<(String, f32)>,       // transient toast: (message, seconds left)
-    pub styled: bool,                        // one-shot egui style application
-    pub strobe: bool,                        // run 2 sim steps per rendered frame (freezes period-2 objects)
-    pub last_used_grid: Option<bool>,        // detect Auto mode silently switching step modes
+    pub trace_last_painted: Option<(usize, usize)>, // stroke tracking so Add/Mult brushes fire once per cell
+    pub status: Option<(String, f32)>,              // transient toast: (message, seconds left)
+    pub styled: bool,                               // one-shot egui style application
+    pub strobe: bool, // run 2 sim steps per rendered frame (freezes period-2 objects)
+    pub last_used_grid: Option<bool>, // detect Auto mode silently switching step modes
 
     // ── Audio-driven matrix modulation ────────────────────────────────
     pub audio: AudioMod,
@@ -114,7 +125,7 @@ pub struct UiState {
     pub mix_drag: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionMode {
     Rect,
     Brush,
@@ -129,15 +140,14 @@ pub enum ActiveMatrixTab {
     Audio,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TraceRenderMode {
     Off,
-    Simple, // Java-style framebuffer accumulation
     Lines,
     Dots,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TraceBrush {
     Set,
     Add,
@@ -146,7 +156,7 @@ pub enum TraceBrush {
     Erase,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DragMode {
     None,
     Selecting,
@@ -156,10 +166,14 @@ pub enum DragMode {
 impl UiState {
     pub fn new() -> Self {
         Self {
+            nd: Default::default(),
+            session: crate::session::SessionUi::new(),
+            playback: Default::default(),
             paused: false,
             step_once: false,
             use_gpu_physics: true,
             cap_to_bounds: true,
+            soft_particles: false,
 
             fly_pos: Vec3::new(0.5, 0.5, 2.0),
             fly_yaw: -std::f32::consts::PI / 2.0, // Point toward -Z (center)
@@ -193,12 +207,15 @@ impl UiState {
             view_matrix: glam::Mat4::IDENTITY,
             slice_center: 0.0,
             slice_thickness: 0.2,
+            extra_slice_centers: [0.5; MAX_DIM],
+            extra_slice_thickness: [1.0; MAX_DIM],
+            pending_dimension: None,
             move_start_mouse: None,
             move_start_positions: Vec::new(),
             pending_assign_type: 0,
 
-
             trace_len: 16,
+            trace_len_limit: crate::renderer::compute::MAX_TRAIL,
             trace_fade_alpha: 0.98,
             trace_render_mode: TraceRenderMode::Off,
             trace_type_filter: -1,
@@ -220,7 +237,7 @@ impl UiState {
             force_presets: Vec::new(),
             reaction_presets: Vec::new(),
             active_matrix_tab: ActiveMatrixTab::Rules,
-            
+
             // Profile fields
             save_profile_now: false,
             auto_save_profiles: false,
@@ -268,7 +285,6 @@ impl UiState {
     pub fn fly_right(&self) -> Vec3 {
         self.fly_forward().cross(Vec3::Y).normalize()
     }
-
 }
 
 // ── Main UI entry point ───────────────────────────────────────────────────────
@@ -293,6 +309,8 @@ pub fn draw_ui(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
     crate::ui::spawn_ui::sync_mix(sim, ui);
 
     draw_controls(ctx, sim, ui);
+    crate::multidim::draw(ctx, sim, ui);
+    crate::session::draw(ctx, sim, ui);
     if ui.show_matrix_editor {
         draw_tabbed_matrices(ctx, sim, ui);
     }
@@ -303,13 +321,23 @@ pub fn draw_ui(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
     draw_status_flash(ctx, ui);
 }
 
-/// One-shot egui style: bigger click targets, consistent rounding, filled sliders.
+/// One-shot egui style: bigger click targets, consistent rounding, filled
+/// sliders, and a single coherent accent color used everywhere egui would
+/// otherwise mix its own defaults (selection tint, hyperlinks) with this
+/// app's controls.
 fn apply_style(ctx: &Context) {
     let mut style = (*ctx.style()).clone();
+
+    // One accent, used for selection highlights, filled slider tracks, and
+    // hyperlinks, so those three no longer land on three different blues.
+    let accent = Color32::from_rgb(90, 170, 235);
+
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.slider_width = 150.0;
+    style.spacing.window_margin = egui::Margin::from(10.0);
+    style.spacing.slider_width = 120.0;
     style.spacing.interact_size.y = 22.0;
+
     let round = egui::Rounding::same(5.0);
     style.visuals.widgets.inactive.rounding = round;
     style.visuals.widgets.hovered.rounding = round;
@@ -317,8 +345,26 @@ fn apply_style(ctx: &Context) {
     style.visuals.widgets.open.rounding = round;
     style.visuals.widgets.noninteractive.rounding = round;
     style.visuals.widgets.hovered.expansion = 1.0;
+
     style.visuals.window_rounding = egui::Rounding::same(8.0);
+    // Several floating windows (Controls, Matrix Editor, Book) commonly sit
+    // on screen at once, over a busy particle render rather than a plain
+    // desktop background. A soft drop shadow gives them a real sense of
+    // stacking order; a faint border keeps their edges legible over bright
+    // particles/trails instead of just blending into whatever is behind them.
+    style.visuals.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(1.0, 4.0),
+        blur: 16.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(110),
+    };
+    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_gray(75));
+
+    style.visuals.selection.bg_fill = accent.linear_multiply(0.5);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.hyperlink_color = accent;
     style.visuals.slider_trailing_fill = true;
+
     ctx.set_style(style);
 }
 
@@ -388,9 +434,13 @@ fn matrix_cell(
         let painter = e.painter();
         painter.rect_filled(rect, 3.0, fill);
         if selected {
-            painter.rect_stroke(rect, 3.0, egui::Stroke::new(2.0, Color32::WHITE));
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(2.0_f32, Color32::WHITE));
         } else if active {
-            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, Color32::from_gray(220)));
+            painter.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0_f32, Color32::from_gray(220)),
+            );
         }
         if let Some(t) = text {
             let lum = fill.r() as u32 + fill.g() as u32 + fill.b() as u32;
@@ -517,11 +567,7 @@ fn set_trace_cell(
     }
 }
 
-fn draw_trace_matrix_ui(
-    ui: &mut egui::Ui,
-    state: &mut UiState,
-    sim: &mut crate::sim::SimState,
-) {
+fn draw_trace_matrix_ui(ui: &mut egui::Ui, state: &mut UiState, sim: &mut crate::sim::SimState) {
     let n = sim.params.type_count as usize;
 
     ui.horizontal(|ui| {
@@ -529,23 +575,23 @@ fn draw_trace_matrix_ui(
             .selected_text(format!("{:?}", state.trace_render_mode))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut state.trace_render_mode, TraceRenderMode::Off, "Off");
-                ui.selectable_value(&mut state.trace_render_mode, TraceRenderMode::Lines, "Lines");
+                ui.selectable_value(
+                    &mut state.trace_render_mode,
+                    TraceRenderMode::Lines,
+                    "Lines",
+                );
                 ui.selectable_value(&mut state.trace_render_mode, TraceRenderMode::Dots, "Dots");
             });
 
-        ui.add(
-            egui::Slider::new(&mut state.trace_len, 1..=crate::renderer::compute::MAX_TRAIL)
-                .text("history"),
-        );
+        let trace_len_limit = state.trace_len_limit;
+        ui.add(egui::Slider::new(&mut state.trace_len, 1..=trace_len_limit).text("history"));
         ui.add(egui::Slider::new(&mut state.trace_fade_alpha, 0.0..=1.0).text("fade"));
         ui.checkbox(&mut state.trace_ui_edit_only, "edit only")
             .on_hover_text("Edit the trace matrix without rendering trails");
     });
 
     ui.separator();
-    ui.label(
-        RichText::new("pick a brush · click/drag cells to paint · right-click erase").weak(),
-    );
+    ui.label(RichText::new("pick a brush · click/drag cells to paint · right-click erase").weak());
 
     ui.horizontal(|ui| {
         ui.label("Brush:");
@@ -634,12 +680,13 @@ fn draw_trace_matrix_ui(
                     if trace_idx < sim.trace_len_matrix.len()
                         && reaction_idx < sim.reaction_table.len()
                     {
-                        sim.trace_len_matrix[trace_idx] =
-                            if sim.reaction_table[reaction_idx] > 0 {
-                                state.trace_paint_value
-                            } else {
-                                0
-                            };
+                        // -1 means "no reaction"; 0 is a valid product type
+                        // (Type 0), so it must trace too.
+                        sim.trace_len_matrix[trace_idx] = if sim.reaction_table[reaction_idx] >= 0 {
+                            state.trace_paint_value
+                        } else {
+                            0
+                        };
                     }
                 }
             }
@@ -658,7 +705,13 @@ fn draw_trace_matrix_ui(
     }
 
     // Find max value for heatmap normalization
-    let max_value = sim.trace_len_matrix.iter().copied().max().unwrap_or(1).max(1);
+    let max_value = sim
+        .trace_len_matrix
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     let hovered_last = state.trace_hovered_cell;
     state.trace_hovered_cell = None;
@@ -794,11 +847,10 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
         });
     }
 
-    // Toggle trail with T key - cycle through functional modes (skip Simple)
+    // Toggle trail with T key.
     if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::T)) {
         ui.trace_render_mode = match ui.trace_render_mode {
             TraceRenderMode::Off => TraceRenderMode::Dots,
-            TraceRenderMode::Simple => TraceRenderMode::Dots,
             TraceRenderMode::Dots => TraceRenderMode::Lines,
             TraceRenderMode::Lines => TraceRenderMode::Off,
         };
@@ -873,7 +925,7 @@ fn handle_input(ctx: &egui::Context, sim: &mut SimState, ui: &mut UiState) {
 
     // Active move-drag takes full control
     if ui.drag_mode == DragMode::MovingSelection {
-        handle_move_drag(pointer, latest, sim, ui);
+        handle_move_drag(pointer, latest, sim, ui, ctx.pixels_per_point());
         return;
     }
 
@@ -966,20 +1018,37 @@ fn handle_move_drag(
     latest: Option<egui::Pos2>,
     sim: &mut SimState,
     ui: &mut UiState,
+    pixels_per_point: f32,
 ) {
     if pointer.button_down(egui::PointerButton::Middle) {
         if let (Some(start), Some(now)) = (ui.move_start_mouse, latest) {
             let dx = now.x - start.x;
             let dy = now.y - start.y;
             let (right, up, _) = crate::selection::camera_plane_axes(ui.view_matrix);
-            let sx = sim.params.bounds / ui.viewport[0] as f32;
-            let sy = sim.params.bounds / ui.viewport[1] as f32;
+            // egui pointer coordinates are in logical points, but ui.viewport
+            // is populated from the surface size in physical pixels (see
+            // draw.rs). Without this conversion, drags on any scaled/HiDPI
+            // display (pixels_per_point != 1.0) move the selection slower
+            // than the cursor and it drifts away mid-drag.
+            let viewport_x = ui.viewport[0] as f32 / pixels_per_point;
+            let viewport_y = ui.viewport[1] as f32 / pixels_per_point;
+            let sx = sim.params.bounds / viewport_x;
+            let sy = sim.params.bounds / viewport_y;
             let delta = right * (dx * sx) + up * (-dy * sy);
 
             for (slot, &idx) in ui.selected_indices.iter().enumerate() {
                 if let Some(p) = sim.particles.get_mut(idx) {
-                    let start_pos = glam::Vec3::from(ui.move_start_positions[slot]);
-                    p.position = (start_pos + delta).into();
+                    let start_pos = ui.move_start_positions[slot];
+                    p.position = start_pos;
+                    let movement = ui
+                        .nd
+                        .unproject_delta(delta.to_array(), sim.params.dimension);
+                    for d in 0..sim.params.dimension {
+                        p.position[d] += movement[d];
+                        if sim.params.wrap {
+                            p.position[d] = p.position[d].rem_euclid(sim.params.bounds);
+                        }
+                    }
                 }
             }
             sim.particles_dirty = true;
@@ -996,7 +1065,12 @@ fn handle_move_drag(
 fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
     egui::Window::new("Controls")
         .default_pos([12.0, 12.0])
-        .default_width(260.0)
+        .default_width(310.0)
+        // Previously unset, so the window auto-grew to fit every section and
+        // routinely ran off the bottom of the screen on first launch. A fixed
+        // default plus the inner ScrollArea (below) gives a predictable
+        // initial size that still reaches every control on a laptop screen.
+        .default_height(600.0)
         .resizable(true)
         .show(ctx, |e| {
             // The panel outgrew most screens once Spawn gained the chart, so the
@@ -1006,9 +1080,36 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
             .auto_shrink([false, false])
             .id_source("controls_scroll")
             .show(e, |e| {
+            e.set_max_width(290.0);
+            e.checkbox(&mut ui.nd.open, "Dimensions & projection");
+            e.checkbox(&mut ui.session.open, "Session & creature inspector");
+            crate::session::playback_controls(e, &mut ui.playback);
             e.label(format!("Particles: {}", sim.particles.len()));
             e.label(format!("Types:     {}", sim.params.type_count));
             e.label(format!("Steps:     {}", sim.step_count));
+            e.separator();
+
+            // Both other windows are toggled from one obvious spot instead of
+            // being scattered through the panel (Matrix Editor used to live
+            // between Physics and CPU stepping, the Book button at the very
+            // bottom) — the pressed/unpressed look also doubles as an at-a-
+            // glance "what's open" indicator.
+            e.horizontal(|e| {
+                if e
+                    .selectable_label(ui.show_matrix_editor, "🧮 Matrix Editor")
+                    .on_hover_text("M")
+                    .clicked()
+                {
+                    ui.show_matrix_editor = !ui.show_matrix_editor;
+                }
+                if e
+                    .selectable_label(ui.show_book, "📖 Creature Book")
+                    .on_hover_text("B")
+                    .clicked()
+                {
+                    ui.show_book = !ui.show_book;
+                }
+            });
             e.separator();
 
             e.horizontal(|e| {
@@ -1053,6 +1154,75 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
             e.separator();
 
             e.checkbox(&mut ui.use_gpu_physics, "Use GPU Physics");
+            if e.checkbox(&mut sim.params.gpu_grid,"GPU neighbor grid (opt-in)").changed(){sim.params_dirty=true;}
+            e.small("Grid uses full-dimensional distances, but can change floating-point accumulation order.");
+            {
+                // The two backends use different units for r_max, max_speed and
+                // mix_radius — CPU scales by bounds/20, GPU uses raw values.
+                // That's deliberate (see GpuParams::from) but invisible, and an
+                // unlabelled checkbox that rescales physics by 20x is the most
+                // confusing thing in this UI. So: show the effective radius.
+                let scale = sim.params.bounds / 20.0;
+                let eff = if ui.use_gpu_physics {
+                    sim.params.r_max
+                } else {
+                    sim.params.r_max * scale
+                };
+                // Furthest two particles can be apart. With wrap the box folds,
+                // so the worst case is half a box on each axis.
+                let reach = if sim.params.wrap {
+                    sim.params.bounds * 0.5 * (sim.params.dimension as f32).sqrt()
+                } else {
+                    sim.params.bounds * (sim.params.dimension as f32).sqrt()
+                };
+                let all_pairs = eff >= reach;
+
+                e.label(
+                    RichText::new(format!(
+                        "{} units - effective r_max {:.4} / reach {:.4}",
+                        if ui.use_gpu_physics { "GPU raw" } else { "CPU scaled" },
+                        eff,
+                        reach
+                    ))
+                    .weak()
+                    .small(),
+                );
+
+                if all_pairs {
+                    e.label(
+                        RichText::new("every pair interacts")
+                            .small()
+                            .color(Color32::from_rgb(120, 200, 140)),
+                    );
+                } else {
+                    e.label(
+                        RichText::new(format!(
+                            "culled at {:.0}% of reach - not all pairs",
+                            eff / reach * 100.0
+                        ))
+                        .small()
+                        .color(Color32::from_rgb(210, 180, 90)),
+                    );
+                    if e.button("Force all-pairs")
+                        .on_hover_text(
+                            "Unchecks 'cap sliders to bounds' and raises r_max\n\
+                             past the furthest possible separation, so no pair\n\
+                             is ever culled on either backend.",
+                        )
+                        .clicked()
+                    {
+                        ui.cap_to_bounds = false;
+                        // Satisfy both unit conventions at once: raw >= reach
+                        // and reach/scale >= reach. Whichever backend is active,
+                        // nothing gets culled.
+                        let need_gpu = reach;
+                        let need_cpu = if scale > 0.0 { reach / scale } else { 20.0 };
+                        sim.params.r_max = need_gpu.max(need_cpu).min(20.0);
+                        sim.params_dirty = true;
+                        ui.flash(format!("r_max set to {:.3}", sim.params.r_max));
+                    }
+                }
+            }
             e.separator();
 
             let mut changed = false;
@@ -1062,7 +1232,7 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
 
                 let mut type_count = sim.params.type_count;
                 if e.add(
-                    Slider::new(&mut type_count, 1..=crate::renderer::compute::MAX_TYPES)
+                    Slider::new(&mut type_count, 1..=MAX_TYPES)
                         .text("types"),
                 )
                 .changed()
@@ -1070,6 +1240,17 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                     if type_count != sim.params.type_count {
                         sim.set_type_count(type_count);
                     }
+                }
+
+                let mut dimension = sim.params.dimension;
+                if e.add(Slider::new(&mut dimension, MIN_DIM..=MAX_DIM).text("dimensions"))
+                    .on_hover_text(
+                        "Physics uses every active axis. Rendering projects XYZ and\n\
+                         filters the remaining axes with the slice controls below.",
+                    )
+                    .changed()
+                {
+                    ui.pending_dimension = Some(dimension);
                 }
 
                 let r_max_max = if ui.cap_to_bounds {
@@ -1083,8 +1264,27 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                 changed |= e
                     .add(Slider::new(&mut sim.params.force_scale, 0.0..=20.0).text("force scale"))
                     .changed();
+                // Named for what it does. damping = friction^(dt*60), then
+                // vel *= damping — so 1.0 keeps all velocity (frictionless) and
+                // 0.0 is an instant stop. The old "friction" label read exactly
+                // backwards. Stored value is unchanged, so profiles still load.
                 changed |= e
-                    .add(Slider::new(&mut sim.params.friction, 0.0..=1.0).text("friction"))
+                    .add(
+                        Slider::new(&mut sim.params.friction, 0.0..=1.0)
+                            .text("velocity kept")
+                            .custom_formatter(|v, _| {
+                                if v >= 0.999 {
+                                    "1.000  undamped".to_string()
+                                } else {
+                                    format!("{v:.3}")
+                                }
+                            }),
+                    )
+                    .on_hover_text(
+                        "Fraction of velocity retained per 1/60s.\n\
+                         1.0 = no damping — required to sustain period-2 orbits,\n\
+                         but the sim will pump energy and pin against max speed.",
+                    )
                     .changed();
                 changed |= e
                     .add(Slider::new(&mut sim.params.dt, 0.0001..=0.1).text("dt"))
@@ -1103,6 +1303,12 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                 changed |= e
                     .add(Slider::new(&mut sim.params.particle_size, 0.001..=0.2).text("particle size"))
                     .changed();
+                e.checkbox(&mut ui.soft_particles, "Soft particle edges")
+                    .on_hover_text(
+                        "Antialiased discs. Off is hard-edged and fully\n\
+                         order-independent — preferred when overlapping\n\
+                         particles must not flicker between frames.",
+                    );
                 changed |= e
                     .add(Slider::new(&mut sim.params.bounds, 0.1..=20.0).text("bounds"))
                     .changed();
@@ -1111,9 +1317,6 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                     .changed();
                 changed |= e.checkbox(&mut sim.params.wrap, "Wrap").changed();
                 });
-
-            e.checkbox(&mut ui.show_matrix_editor, "Matrix Editor")
-                .on_hover_text("M");
 
             egui::CollapsingHeader::new("CPU stepping & timing")
                 .default_open(false)
@@ -1209,7 +1412,7 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                         ui.fly_pitch = forward.y.asin();
                     }
                     // Expose raw angles so player can nudge them precisely
-                    e.add(Slider::new(&mut ui.fly_yaw, -3.14..=3.14).text("yaw"));
+                    e.add(Slider::new(&mut ui.fly_yaw, -std::f32::consts::PI..=std::f32::consts::PI).text("yaw"));
                     e.add(Slider::new(&mut ui.fly_pitch, -1.5..=1.5).text("pitch"));
                 }
                 });
@@ -1318,11 +1521,6 @@ fn draw_controls(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                     );
                 }
                 });
-            e.separator();
-
-            if e.button("📖 Creature Book").on_hover_text("B").clicked() {
-                ui.show_book = !ui.show_book;
-            }
             });
         });
 }
@@ -1369,7 +1567,7 @@ fn apply_force_preset(sim: &mut SimState, preset: &str) {
         }
         "Chaotic Dance" => {
             use rand::Rng;
-            let mut rng = rand::thread_rng();
+            let mut rng = sim.next_rng();
             for i in 0..n {
                 for j in 0..n {
                     sim.set_rule(i, j, rng.gen_range(-1.0..1.0));
@@ -1451,7 +1649,7 @@ fn draw_rule_matrix_content(ctx: &Context, sim: &mut SimState, ui: &mut UiState,
         }
         if e.button("Random").clicked() {
             use rand::Rng;
-            let mut rng = rand::thread_rng();
+            let mut rng = sim.next_rng();
             for i in 0..n {
                 for j in 0..n {
                     sim.set_rule(i, j, rng.gen_range(-1.0..1.0));
@@ -1619,8 +1817,10 @@ fn draw_reaction_matrix_content(
     let _dt = ctx.input(|i| i.stable_dt);
 
     e.label(
-        RichText::new("pick a paint below · click/drag cells to paint · right-click erase · scroll cycle")
-            .weak(),
+        RichText::new(
+            "pick a paint below · click/drag cells to paint · right-click erase · scroll cycle",
+        )
+        .weak(),
     );
     e.separator();
 
@@ -1641,15 +1841,22 @@ fn draw_reaction_matrix_content(
     });
 
     // Safety guard warning for GPU reactions
-    if ui.use_gpu_physics && sim.params.reactions_enabled && sim.particles.len() > 10_000 {
+    if ui.use_gpu_physics
+        && sim.params.reactions_enabled
+        && sim.particles.len() > 10_000
+        && crate::renderer::compute::GpuParams::from(&sim.params).grid_res == 0
+    {
         e.separator();
         e.colored_label(
             egui::Color32::RED,
-            "⚠️ GPU reactions disabled above 10k particles until grid reaction pass exists."
+            "⚠️ GPU reactions disabled above 10k particles when no local neighbor grid is active.",
         );
         e.colored_label(
             egui::Color32::YELLOW,
-            format!("Current: {} particles (threshold: 10,000)", sim.particles.len())
+            format!(
+                "Current: {} particles (threshold: 10,000)",
+                sim.particles.len()
+            ),
         );
         e.separator();
     }
@@ -1684,7 +1891,7 @@ fn draw_reaction_matrix_content(
         }
         if e.button("Random").clicked() {
             use rand::Rng;
-            let mut rng = rand::thread_rng();
+            let mut rng = sim.next_rng();
             sim.edit_reaction_table(|reaction_table, n| {
                 for i in 0..n {
                     for j in 0..n {
@@ -1842,8 +2049,8 @@ fn draw_reaction_matrix_content(
 
                                 let scroll = take_scroll(ctx);
                                 if scroll != 0.0 {
-                                    let new_val = (val + scroll.signum() as i32)
-                                        .clamp(-1, (n - 1) as i32);
+                                    let new_val =
+                                        (val + scroll.signum() as i32).clamp(-1, (n - 1) as i32);
                                     sim.set_reaction(row, col, new_val);
                                 }
                             }
@@ -1989,7 +2196,7 @@ fn apply_trace_preset(sim: &mut SimState, preset: &str, max_trace: u32) {
         }
         "Random Burst" => {
             use rand::Rng;
-            let mut rng = rand::thread_rng();
+            let mut rng = sim.next_rng();
             for i in 0..n {
                 for j in 0..n {
                     sim.trace_len_matrix[i * n + j] = if rng.gen_bool(0.3) { max_trace } else { 0 };
@@ -2003,41 +2210,69 @@ fn apply_trace_preset(sim: &mut SimState, preset: &str, max_trace: u32) {
 
 // ── Creature Book panel ───────────────────────────────────────────────────────
 fn draw_book(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
+    // To the right of the Matrix Editor's default column, clear of both it
+    // and Controls, so opening every panel at once doesn't stack them.
     egui::Window::new("📖 Creature Book")
-        .default_pos([12.0, 500.0])
+        .default_pos([970.0, 12.0])
         .default_width(300.0)
+        .resizable(true)
         .show(ctx, |e| {
             e.label(format!("{} creature(s) saved", sim.book.prefabs.len()));
             e.separator();
 
+            e.checkbox(
+                &mut ui.session.save_live_creature,
+                "Include velocities (live creature)",
+            );
+            e.checkbox(
+                &mut ui.session.restore_prefab_rules,
+                "Restore recorded physics when spawning",
+            );
             e.label("Save new creature:");
             e.horizontal(|e| {
                 e.text_edit_singleline(&mut ui.new_prefab_name);
-                if e.button("💾 Save").clicked() && !ui.new_prefab_name.is_empty() {
+                if e.add_enabled(
+                    !ui.selected_indices.is_empty() && !ui.new_prefab_name.is_empty(),
+                    egui::Button::new("💾 Save"),
+                )
+                .clicked()
+                {
                     save_selection_as_prefab(sim, ui, ui.new_prefab_name.clone());
                     ui.new_prefab_name.clear();
                 }
             });
             e.separator();
 
+            // Unbounded before: with enough saved creatures this list simply
+            // pushed the window taller than the screen. Capping it in a
+            // ScrollArea keeps the window a fixed, predictable size.
             let mut to_remove: Option<usize> = None;
-            for (i, prefab) in sim.book.prefabs.iter().enumerate() {
-                e.horizontal(|e| {
-                    let selected = ui.selected_prefab == Some(i);
-                    if e.selectable_label(selected, &prefab.name).clicked() {
-                        ui.selected_prefab = Some(i);
-                    }
-                    e.label(format!("({} particles)", prefab.particle_count));
-                    if e.button("🗑").clicked() {
-                        to_remove = Some(i);
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .id_source("book_list_scroll")
+                .show(e, |e| {
+                    for (i, prefab) in sim.book.prefabs.iter().enumerate() {
+                        e.horizontal(|e| {
+                            let selected = ui.selected_prefab == Some(i);
+                            if e.selectable_label(selected, &prefab.name).clicked() {
+                                ui.selected_prefab = Some(i);
+                            }
+                            e.label(format!("({} particles)", prefab.particle_count));
+                            if e.button("🗑").clicked() {
+                                to_remove = Some(i);
+                            }
+                        });
                     }
                 });
-            }
 
             if let Some(i) = to_remove {
                 sim.book.remove_prefab(i);
-                if ui.selected_prefab == Some(i) {
-                    ui.selected_prefab = None;
+                if let Some(selected) = ui.selected_prefab {
+                    if selected == i {
+                        ui.selected_prefab = None;
+                    } else if selected > i {
+                        ui.selected_prefab = Some(selected - 1);
+                    }
                 }
             }
 
@@ -2045,6 +2280,33 @@ fn draw_book(ctx: &Context, sim: &mut SimState, ui: &mut UiState) {
                 if i < sim.book.prefabs.len() {
                     e.separator();
                     if e.button("▶ Spawn selected creature").clicked() {
+                        if ui.session.restore_prefab_rules {
+                            let prefab = sim.book.prefabs[i].clone();
+                            sim.set_type_count(prefab.type_count);
+                            sim.set_dimension(prefab.dimension);
+                            if let Some(params) = prefab.params {
+                                sim.params = params;
+                            }
+                            if prefab.force_matrix.len()
+                                == sim.params.type_count * sim.params.type_count
+                            {
+                                sim.force_matrix = prefab.force_matrix;
+                                sim.force_matrix_dirty = true;
+                            }
+                            if prefab.reactions.len()
+                                == sim.params.type_count * sim.params.type_count
+                            {
+                                sim.reaction_table = prefab.reactions;
+                                sim.reaction_table_dirty = true;
+                            }
+                            if let Some(gpu) = prefab.gpu {
+                                ui.use_gpu_physics = gpu;
+                            }
+                            sim.params_dirty = true;
+                            ui.audio.armed = false;
+                            ui.extra_slice_thickness = [f32::MAX; MAX_DIM];
+                            ui.nd.normalize(sim.params.dimension);
+                        }
                         let center = Vec3::splat(sim.params.bounds * 0.5);
                         let instance_id = sim.allocate_prefab_instance_id();
                         sim.spawn_prefab(i, center, instance_id);
@@ -2073,19 +2335,55 @@ fn save_selection_as_prefab(sim: &mut SimState, ui: &UiState, name: String) {
         return;
     }
 
-    let com: Vec3 = selected
+    let reference = selected[0].position;
+    let unwrapped: Vec<VecNd> = selected
         .iter()
-        .map(|p| Vec3::from(p.position))
-        .fold(Vec3::ZERO, |a, b| a + b)
-        / selected.len() as f32;
+        .map(|particle| {
+            std::array::from_fn(|d| {
+                if sim.params.wrap {
+                    reference[d]
+                        + crate::session::wrapped_delta(
+                            particle.position[d] - reference[d],
+                            sim.params.bounds,
+                        )
+                } else {
+                    particle.position[d]
+                }
+            })
+        })
+        .collect();
+    let mut com = [0.0; MAX_DIM];
+    for position in &unwrapped {
+        for d in 0..sim.params.dimension {
+            com[d] += position[d];
+        }
+    }
+    for value in com.iter_mut().take(sim.params.dimension) {
+        *value /= selected.len() as f32;
+    }
 
-    let mut prefab = Prefab::new(name, sim.force_matrix.clone(), sim.params.type_count);
+    let mut prefab = Prefab::new(
+        name,
+        sim.force_matrix.clone(),
+        sim.params.type_count,
+        sim.params.dimension,
+    );
     prefab.particle_count = selected.len();
 
-    for p in selected {
+    prefab.params = Some(sim.params.clone());
+    prefab.gpu = Some(ui.use_gpu_physics);
+    prefab.reactions = sim.reaction_table.clone();
+    for (p, position) in selected.iter().zip(&unwrapped) {
         prefab.particles.push(PrefabParticle {
-            relative_position: (Vec3::from(p.position) - com).into(),
+            relative_position: (0..sim.params.dimension)
+                .map(|d| position[d] - com[d])
+                .collect(),
             kind: p.kind,
+            velocity: if ui.session.save_live_creature {
+                p.velocity[..sim.params.dimension].to_vec()
+            } else {
+                Vec::new()
+            },
         });
     }
 
@@ -2105,5 +2403,3 @@ fn type_color_egui(kind: usize) -> Color32 {
     ];
     colors[kind % colors.len()]
 }
-
-

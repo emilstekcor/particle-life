@@ -1,7 +1,9 @@
 mod audio;
 mod crash_profile;
+mod multidim;
 mod renderer;
 mod selection;
+mod session;
 mod sim;
 mod ui;
 
@@ -17,16 +19,15 @@ use ui::UiState;
 
 fn main() {
     env_logger::init();
-    
-    // Debug: Print struct sizes to verify alignment
-    println!("=== STRUCT SIZE VERIFICATION ===");
-    println!("SelectionParams: {} bytes", std::mem::size_of::<renderer::compute::SelectionParams>());
-    println!("TrailPoint: {} bytes", std::mem::size_of::<renderer::compute::TrailPoint>());
-    println!("Particle: {} bytes", std::mem::size_of::<sim::Particle>());
-    println!("GpuParticle: {} bytes", std::mem::size_of::<sim::GpuParticle>());
-    println!("GpuParams: {} bytes", std::mem::size_of::<renderer::compute::GpuParams>());
-    println!("TrailParams: {} bytes", std::mem::size_of::<renderer::compute::TrailParams>());
-    println!("================================");
+
+    log::debug!(
+        "GPU layouts: particle={} params={} selection={} trail_point={} camera={}",
+        std::mem::size_of::<sim::GpuParticle>(),
+        std::mem::size_of::<renderer::compute::GpuParams>(),
+        std::mem::size_of::<renderer::compute::SelectionParams>(),
+        std::mem::size_of::<renderer::compute::TrailPoint>(),
+        std::mem::size_of::<renderer::draw::CameraUniform>(),
+    );
 
     // Set up panic hook to show crash profile location on panic
     std::panic::set_hook(Box::new(|info| {
@@ -40,7 +41,7 @@ fn main() {
     // Build the OS window
     let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new()
-        .with_title("Particle Life 3D")
+        .with_title("Particle Life Hyperdimensional")
         .with_inner_size(winit::dpi::LogicalSize::new(1400u32, 900u32))
         .build(&event_loop)
         .unwrap();
@@ -84,37 +85,13 @@ fn main() {
                         }
 
                         WindowEvent::RedrawRequested => {
-                            // Physics stepping control
-                            let should_step = if ui.paused {
-                                std::mem::take(&mut ui.step_once)
-                            } else {
-                                true
-                            };
-
-                            if should_step {
-                                if ui.use_gpu_physics {
-                                    // GPU physics is handled in the renderer
-                                    // step_count will be incremented there
-                                } else {
-                                    // CPU physics. Strobe runs two sim steps per
-                                    // rendered frame so period-2 oscillating
-                                    // objects appear frozen; a manual Step while
-                                    // paused advances one step (flips the phase).
-                                    let steps = if ui.strobe && !ui.paused { 2 } else { 1 };
-                                    for _ in 0..steps {
-                                        sim.step();
-                                    }
-                                    sim.particles_dirty = true;
-                                }
-                            }
-
-                            // Selection readback + CPU/GPU particle sync are
-                            // handled inside renderer.render (once per
-                            // selection gesture, not per frame).
+                            let previous_step = sim.step_count;
                             renderer.render(&window, &mut sim, &mut ui);
 
                             // Flush book saving if dirty (deferred I/O to avoid blocking UI)
-                            sim.book.flush_if_dirty();
+                            if let Some(Err(e)) = sim.book.flush_if_dirty() {
+                                ui.flash(format!("Creature save failed: {e}"));
+                            }
 
                             // ── Profiles ────────────────────────────────────
                             if std::mem::take(&mut ui.save_profile_now) {
@@ -126,7 +103,7 @@ fn main() {
                                 );
                             }
                             if ui.auto_save_profiles
-                                && should_step
+                                && sim.step_count != previous_step
                                 && sim.step_count > 0
                                 && sim.step_count % ui.auto_save_interval as u64 == 0
                             {
@@ -139,7 +116,11 @@ fn main() {
                 }
 
                 Event::AboutToWait => {
-                    let animating = !ui.paused || ui.step_once || ui.camera_mode;
+                    let animating = !ui.paused
+                        || ui.step_once
+                        || ui.camera_mode
+                        || ui.audio.playing
+                        || ui.nd.animate;
                     if animating {
                         target.set_control_flow(ControlFlow::Poll);
                         window.request_redraw();
@@ -154,5 +135,5 @@ fn main() {
         .unwrap();
 }
 
-
-
+#[cfg(test)]
+mod validation;

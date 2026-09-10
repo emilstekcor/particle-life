@@ -1,6 +1,10 @@
-use crate::sim::{CpuStepMode, SimState};
-use rand::Rng;
+use crate::sim::{CellCoord, CpuStepMode, SimState, VecNd, MAX_DIM};
 use std::time::Instant;
+
+/// Above five dimensions, 3^D neighboring cells cost more than the sparse
+/// grid normally saves. Physics remains exact by falling back to the naive
+/// pair scan.
+const MAX_GRID_DIM: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolvedStepMode {
@@ -15,20 +19,13 @@ struct StepStats {
     grid_res: usize,
 }
 
-/// CPU stepping:
-/// - Naive: exact O(N²)
-/// - GridExact: exact neighbor cull using a uniform grid
-///
-/// GridExact is BIT-IDENTICAL to Naive: candidate neighbors are gathered,
-/// sorted by index, and accumulated in ascending order — the same f32 sum
-/// Naive produces (out-of-range pairs contribute exactly nothing). This
-/// matters because the period-2 oscillating "objects" this project studies
-/// live on a floating-point knife edge; switching step modes must not
-/// perturb them.
 pub fn cpu_step(state: &mut SimState) {
     let frame_start = Instant::now();
-
     let count = state.particles.len();
+    state.trace_timers.resize(count, 0);
+    for t in &mut state.trace_timers {
+        *t = t.saturating_sub(1);
+    }
     if count == 0 {
         state.last_step_used_grid = false;
         state.last_neighbor_checks = 0;
@@ -37,38 +34,32 @@ pub fn cpu_step(state: &mut SimState) {
         return;
     }
 
-    let mode = resolve_step_mode(state, count);
-    let stats = match mode {
+    let stats = match resolve_step_mode(state, count) {
         ResolvedStepMode::Naive => cpu_step_naive(state),
         ResolvedStepMode::GridExact => cpu_step_grid_exact(state),
     };
 
-    // Apply reactions after physics integration
     apply_reactions(state);
-
     state.last_step_used_grid = stats.used_grid;
     state.last_neighbor_checks = stats.neighbor_checks;
     state.last_grid_res = stats.grid_res;
-
-    let elapsed_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
-    state.last_step_ms = elapsed_ms;
-
-    if state.avg_step_ms == 0.0 {
-        state.avg_step_ms = elapsed_ms;
+    state.last_step_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+    state.avg_step_ms = if state.avg_step_ms == 0.0 {
+        state.last_step_ms
     } else {
-        state.avg_step_ms = state.avg_step_ms * 0.90 + elapsed_ms * 0.10;
-    }
+        state.avg_step_ms * 0.95 + state.last_step_ms * 0.05
+    };
 }
 
 fn resolve_step_mode(state: &SimState, count: usize) -> ResolvedStepMode {
+    if state.params.dimension > MAX_GRID_DIM {
+        return ResolvedStepMode::Naive;
+    }
     match state.params.cpu_step_mode {
         CpuStepMode::Naive => ResolvedStepMode::Naive,
         CpuStepMode::GridExact => ResolvedStepMode::GridExact,
         CpuStepMode::Auto => {
-            if count >= state.params.auto_grid_threshold
-                && state.params.r_max > 0.0
-                && state.params.bounds > 0.0
-            {
+            if count >= state.params.auto_grid_threshold {
                 ResolvedStepMode::GridExact
             } else {
                 ResolvedStepMode::Naive
@@ -79,109 +70,15 @@ fn resolve_step_mode(state: &SimState, count: usize) -> ResolvedStepMode {
 
 fn cpu_step_naive(state: &mut SimState) -> StepStats {
     let count = state.particles.len();
-    if count == 0 {
-        return StepStats::default();
-    }
+    let mut velocities = std::mem::take(&mut state.vel_scratch);
+    velocities.resize(count, [0.0; MAX_DIM]);
+    let mut neighbor_checks = 0;
 
-    let dt = state.params.dt;
-    let r_max = state.params.scaled_r_max();
-    let r_max_sq = r_max * r_max;
-    let force_scale = state.params.force_scale;
-    let friction = state.params.friction;
-    let wrap = state.params.wrap;
-    let bounds = state.params.bounds;
-    let beta = state.params.beta;
-    let max_speed = state.params.scaled_max_speed();
-    let type_count = state.params.type_count;
-
-    let damping = friction.powf(dt * 60.0);
-
-    // Prepare scratch buffer
-    state.vel_scratch.resize(count, [0.0; 3]);
-    for (i, p) in state.particles.iter().enumerate() {
-        state.vel_scratch[i] = p.velocity;
-    }
-    let mut neighbor_checks = 0_u64;
-
-    // Compute forces
     for i in 0..count {
-        let pi_pos = state.particles[i].position;
-        let pi_kind = state.particles[i].kind as usize;
-
-        let mut fx = 0.0_f32;
-        let mut fy = 0.0_f32;
-        let mut fz = 0.0_f32;
-
-        for j in 0..count {
-            neighbor_checks += 1;
-            if i == j {
-                continue;
-            }
-
-            let pj_pos = state.particles[j].position;
-            let pj_kind = state.particles[j].kind as usize;
-
-            let mut dx = pj_pos[0] - pi_pos[0];
-            let mut dy = pj_pos[1] - pi_pos[1];
-            let mut dz = pj_pos[2] - pi_pos[2];
-
-            if wrap {
-                dx = wrap_delta(dx, bounds);
-                dy = wrap_delta(dy, bounds);
-                dz = wrap_delta(dz, bounds);
-            }
-
-            let dist_sq = dx * dx + dy * dy + dz * dz;
-            if dist_sq < 1e-10 || dist_sq > r_max_sq {
-                continue;
-            }
-
-            let dist = dist_sq.sqrt();
-            let dn = dist / r_max;
-
-            let a = if dn < beta {
-                dn / beta - 1.0
-            } else {
-                let matrix_index = pi_kind * type_count + pj_kind;
-                let attr = if matrix_index < state.force_matrix.len() {
-                    state.force_matrix[matrix_index]
-                } else {
-                    0.0 // Default to neutral force if out of bounds
-                };
-                attr * (1.0 - ((2.0 * dn - 1.0 - beta) / (1.0 - beta)).abs())
-            };
-
-            let inv_dist = 1.0 / dist;
-            fx += a * dx * inv_dist;
-            fy += a * dy * inv_dist;
-            fz += a * dz * inv_dist;
-        }
-
-        let vel = &mut state.vel_scratch[i];
-        vel[0] = (vel[0] + fx * force_scale * dt) * damping;
-        vel[1] = (vel[1] + fy * force_scale * dt) * damping;
-        vel[2] = (vel[2] + fz * force_scale * dt) * damping;
-
-        clamp_velocity(vel, max_speed);
+        velocities[i] = compute_velocity(state, i, 0..count, &mut neighbor_checks);
     }
-
-    // Apply velocities to particle positions
-    let dt = state.params.dt;
-    let wrap = state.params.wrap;
-    let bounds = state.params.bounds;
-
-    for (i, p) in state.particles.iter_mut().enumerate() {
-        p.velocity = state.vel_scratch[i];
-        p.position[0] += p.velocity[0] * dt;
-        p.position[1] += p.velocity[1] * dt;
-        p.position[2] += p.velocity[2] * dt;
-
-        if wrap {
-            for coord in &mut p.position {
-                *coord = coord.rem_euclid(bounds);
-            }
-        }
-    }
+    integrate(state, &velocities);
+    state.vel_scratch = velocities;
 
     StepStats {
         used_grid: false,
@@ -192,152 +89,47 @@ fn cpu_step_naive(state: &mut SimState) -> StepStats {
 
 fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
     let count = state.particles.len();
-    if count == 0 {
-        return StepStats::default();
-    }
-
-    let dt = state.params.dt;
-    let r_max = state.params.scaled_r_max();
-    let r_max_sq = r_max * r_max;
-    let force_scale = state.params.force_scale;
-    let friction = state.params.friction;
-    let wrap = state.params.wrap;
+    let dim = state.params.dimension;
     let bounds = state.params.bounds;
-    let beta = state.params.beta;
-    let max_speed = state.params.scaled_max_speed();
-    let type_count = state.params.type_count;
+    let wrap = state.params.wrap;
+    let grid_res = choose_grid_res(bounds, state.params.scaled_r_max());
 
-    let damping = friction.powf(dt * 60.0);
-
-    let grid_res = choose_grid_res(bounds, r_max);
-    let total_cells = grid_res * grid_res * grid_res;
-
-    // Prepare buckets scratch buffer
-    state.buckets_scratch.resize_with(total_cells, Vec::new);
-    for b in &mut state.buckets_scratch {
-        b.clear();
+    let mut buckets = std::mem::take(&mut state.buckets_scratch);
+    buckets.clear();
+    for (i, particle) in state.particles.iter().enumerate() {
+        buckets
+            .entry(cell_coords(particle.position, bounds, grid_res, wrap, dim))
+            .or_default()
+            .push(i);
     }
 
-    for (i, p) in state.particles.iter().enumerate() {
-        let [cx, cy, cz] = cell_coords(p.position, bounds, grid_res, wrap);
-        let cell_id = cell_index(cx, cy, cz, grid_res);
-        state.buckets_scratch[cell_id].push(i);
-    }
-
-    // Prepare velocity scratch buffer
-    state.vel_scratch.resize(count, [0.0; 3]);
-    for (i, p) in state.particles.iter().enumerate() {
-        state.vel_scratch[i] = p.velocity;
-    }
-    let mut neighbor_checks = 0_u64;
-
-    // Candidate-neighbor scratch, reused across particles.
-    let mut neigh: Vec<usize> = Vec::with_capacity(128);
+    let mut velocities = std::mem::take(&mut state.vel_scratch);
+    velocities.resize(count, [0.0; MAX_DIM]);
+    let mut neighbor_checks = 0;
+    let mut candidates = Vec::with_capacity(256);
+    let mut keys = Vec::with_capacity(3usize.pow(dim as u32));
 
     for i in 0..count {
-        let pi_pos = state.particles[i].position;
-        let pi_kind = state.particles[i].kind as usize;
-        let [cx, cy, cz] = cell_coords(pi_pos, bounds, grid_res, wrap);
-
-        let mut fx = 0.0_f32;
-        let mut fy = 0.0_f32;
-        let mut fz = 0.0_f32;
-
-        // Gather candidates first, then accumulate in ascending index order.
-        // Sorting makes the f32 sum bit-identical to Naive; dedup fixes the
-        // double-count when wrap is on and grid_res <= 2 (neighbor offsets
-        // alias onto the same cell).
-        neigh.clear();
-        for ox in -1isize..=1 {
-            let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else {
-                continue;
-            };
-            for oy in -1isize..=1 {
-                let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else {
-                    continue;
-                };
-                for oz in -1isize..=1 {
-                    let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else {
-                        continue;
-                    };
-                    let nid = cell_index(nx, ny, nz, grid_res);
-                    neigh.extend_from_slice(&state.buckets_scratch[nid]);
-                }
+        let center = cell_coords(state.particles[i].position, bounds, grid_res, wrap, dim);
+        neighbor_keys(center, dim, grid_res, wrap, &mut keys);
+        candidates.clear();
+        for key in &keys {
+            if let Some(indices) = buckets.get(key) {
+                candidates.extend_from_slice(indices);
             }
         }
-        neigh.sort_unstable();
-        neigh.dedup();
 
-        for &j in &neigh {
-            neighbor_checks += 1;
-            if i == j {
-                continue;
-            }
-
-            let pj_pos = state.particles[j].position;
-            let pj_kind = state.particles[j].kind as usize;
-
-            let mut dx = pj_pos[0] - pi_pos[0];
-            let mut dy = pj_pos[1] - pi_pos[1];
-            let mut dz = pj_pos[2] - pi_pos[2];
-
-            if wrap {
-                dx = wrap_delta(dx, bounds);
-                dy = wrap_delta(dy, bounds);
-                dz = wrap_delta(dz, bounds);
-            }
-
-            let dist_sq = dx * dx + dy * dy + dz * dz;
-            if dist_sq < 1e-10 || dist_sq > r_max_sq {
-                continue;
-            }
-
-            let dist = dist_sq.sqrt();
-            let dn = dist / r_max;
-
-            let a = if dn < beta {
-                dn / beta - 1.0
-            } else {
-                let matrix_index = pi_kind * type_count + pj_kind;
-                let attr = if matrix_index < state.force_matrix.len() {
-                    state.force_matrix[matrix_index]
-                } else {
-                    0.0 // Default to neutral force if out of bounds
-                };
-                attr * (1.0 - ((2.0 * dn - 1.0 - beta) / (1.0 - beta)).abs())
-            };
-
-            let inv_dist = 1.0 / dist;
-            fx += a * dx * inv_dist;
-            fy += a * dy * inv_dist;
-            fz += a * dz * inv_dist;
-        }
-
-        let vel = &mut state.vel_scratch[i];
-        vel[0] = (vel[0] + fx * force_scale * dt) * damping;
-        vel[1] = (vel[1] + fy * force_scale * dt) * damping;
-        vel[2] = (vel[2] + fz * force_scale * dt) * damping;
-
-        clamp_velocity(vel, max_speed);
+        // Matching the naive ascending-index accumulation order makes GridExact
+        // bit-identical, including on tiny wrapped grids where cells alias.
+        candidates.sort_unstable();
+        candidates.dedup();
+        velocities[i] =
+            compute_velocity(state, i, candidates.iter().copied(), &mut neighbor_checks);
     }
 
-    // Apply velocities to particle positions
-    let dt = state.params.dt;
-    let wrap = state.params.wrap;
-    let bounds = state.params.bounds;
-
-    for (i, p) in state.particles.iter_mut().enumerate() {
-        p.velocity = state.vel_scratch[i];
-        p.position[0] += p.velocity[0] * dt;
-        p.position[1] += p.velocity[1] * dt;
-        p.position[2] += p.velocity[2] * dt;
-
-        if wrap {
-            for coord in &mut p.position {
-                *coord = coord.rem_euclid(bounds);
-            }
-        }
-    }
+    integrate(state, &velocities);
+    state.vel_scratch = velocities;
+    state.buckets_scratch = buckets;
 
     StepStats {
         used_grid: true,
@@ -346,223 +138,305 @@ fn cpu_step_grid_exact(state: &mut SimState) -> StepStats {
     }
 }
 
-fn clamp_velocity(vel: &mut [f32; 3], max_speed: f32) {
-    let speed_sq = vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2];
-    if speed_sq > max_speed * max_speed {
-        let speed = speed_sq.sqrt();
-        let scale = max_speed / speed;
-        vel[0] *= scale;
-        vel[1] *= scale;
-        vel[2] *= scale;
+fn compute_velocity(
+    state: &SimState,
+    i: usize,
+    candidates: impl IntoIterator<Item = usize>,
+    neighbor_checks: &mut u64,
+) -> VecNd {
+    let dim = state.params.dimension;
+    let pi = &state.particles[i];
+    let r_max = state.params.scaled_r_max();
+    let r_max_sq = r_max * r_max;
+    let mut force = [0.0; MAX_DIM];
+
+    if r_max > 0.0 {
+        for j in candidates {
+            *neighbor_checks += 1;
+            if i == j {
+                continue;
+            }
+
+            let pj = &state.particles[j];
+            let mut delta = [0.0; MAX_DIM];
+            let mut dist_sq = 0.0;
+            for d in 0..dim {
+                let raw = pj.position[d] - pi.position[d];
+                delta[d] = if state.params.wrap {
+                    wrap_delta(raw, state.params.bounds)
+                } else {
+                    raw
+                };
+                dist_sq += delta[d] * delta[d];
+            }
+            if dist_sq < 1e-10 || dist_sq > r_max_sq {
+                continue;
+            }
+
+            let dist = dist_sq.sqrt();
+            let normalized = dist / r_max;
+            let attraction = if normalized < state.params.beta {
+                normalized / state.params.beta - 1.0
+            } else {
+                let matrix_index = pi.kind as usize * state.params.type_count + pj.kind as usize;
+                let attr = state.force_matrix.get(matrix_index).copied().unwrap_or(0.0);
+                attr * (1.0
+                    - ((2.0 * normalized - 1.0 - state.params.beta) / (1.0 - state.params.beta))
+                        .abs())
+            };
+            let inv_dist = 1.0 / dist;
+            for d in 0..dim {
+                force[d] += attraction * delta[d] * inv_dist;
+            }
+        }
+    }
+
+    let damping = state.params.friction.powf(state.params.dt * 60.0);
+    let mut velocity = pi.velocity;
+    for d in 0..dim {
+        velocity[d] =
+            (velocity[d] + force[d] * state.params.force_scale * state.params.dt) * damping;
+    }
+    clamp_velocity(&mut velocity, state.params.scaled_max_speed(), dim);
+    velocity
+}
+
+fn integrate(state: &mut SimState, velocities: &[VecNd]) {
+    let dim = state.params.dimension;
+    let dt = state.params.dt;
+    let bounds = state.params.bounds;
+    let wrap = state.params.wrap;
+
+    for (particle, velocity) in state.particles.iter_mut().zip(velocities) {
+        particle.velocity = *velocity;
+        for d in 0..dim {
+            particle.position[d] += particle.velocity[d] * dt;
+            if wrap && bounds > 0.0 {
+                particle.position[d] = particle.position[d].rem_euclid(bounds);
+            }
+        }
     }
 }
 
-fn choose_grid_res(bounds: f32, r_max: f32) -> usize {
-    if bounds <= 0.0 || r_max <= 0.0 {
+fn clamp_velocity(velocity: &mut VecNd, max_speed: f32, dim: usize) {
+    let speed_sq: f32 = velocity[..dim].iter().map(|v| v * v).sum();
+    if speed_sq > max_speed * max_speed && speed_sq > 0.0 {
+        let scale = max_speed / speed_sq.sqrt();
+        for component in velocity.iter_mut().take(dim) {
+            *component *= scale;
+        }
+    }
+}
+
+fn choose_grid_res(bounds: f32, radius: f32) -> usize {
+    if bounds <= 0.0 || radius <= 0.0 {
         return 1;
     }
-
-    let raw = (bounds / r_max).floor() as usize;
-    raw.clamp(1, 200) // cap at 200³ = 8M cells max
+    ((bounds / radius).floor() as usize).clamp(1, 200)
 }
 
-fn wrap_delta(mut d: f32, bounds: f32) -> f32 {
+fn wrap_delta(mut value: f32, bounds: f32) -> f32 {
     let half = bounds * 0.5;
-    if d > half {
-        d -= bounds;
-    } else if d < -half {
-        d += bounds;
+    if value > half {
+        value -= bounds;
+    } else if value < -half {
+        value += bounds;
     }
-    d
+    value
 }
 
-fn cell_coords(pos: [f32; 3], bounds: f32, grid_res: usize, wrap: bool) -> [usize; 3] {
-    [
-        axis_to_cell(pos[0], bounds, grid_res, wrap),
-        axis_to_cell(pos[1], bounds, grid_res, wrap),
-        axis_to_cell(pos[2], bounds, grid_res, wrap),
-    ]
+fn cell_coords(position: VecNd, bounds: f32, grid_res: usize, wrap: bool, dim: usize) -> CellCoord {
+    let mut result = [0; MAX_DIM];
+    for d in 0..dim {
+        result[d] = axis_to_cell(position[d], bounds, grid_res, wrap);
+    }
+    result
 }
 
 fn axis_to_cell(value: f32, bounds: f32, grid_res: usize, wrap: bool) -> usize {
     if grid_res <= 1 || bounds <= 0.0 {
         return 0;
     }
-
-    let v = if wrap {
+    let value = if wrap {
         value.rem_euclid(bounds.max(f32::EPSILON))
     } else {
         value.clamp(0.0, (bounds - f32::EPSILON).max(0.0))
     };
-
-    let scaled = (v / bounds) * grid_res as f32;
-    scaled.floor().clamp(0.0, (grid_res - 1) as f32) as usize
-}
-
-fn cell_index(x: usize, y: usize, z: usize, grid_res: usize) -> usize {
-    x * grid_res * grid_res + y * grid_res + z
+    ((value / bounds) * grid_res as f32)
+        .floor()
+        .clamp(0.0, (grid_res - 1) as f32) as usize
 }
 
 fn neighbor_axis(axis: usize, delta: isize, grid_res: usize, wrap: bool) -> Option<usize> {
     if wrap {
-        let g = grid_res as isize;
-        Some((axis as isize + delta).rem_euclid(g) as usize)
+        Some((axis as isize + delta).rem_euclid(grid_res as isize) as usize)
     } else {
-        let v = axis as isize + delta;
-        if v < 0 || v >= grid_res as isize {
-            None
-        } else {
-            Some(v as usize)
+        let value = axis as isize + delta;
+        (value >= 0 && value < grid_res as isize).then_some(value as usize)
+    }
+}
+
+fn neighbor_keys(
+    center: CellCoord,
+    dim: usize,
+    grid_res: usize,
+    wrap: bool,
+    output: &mut Vec<CellCoord>,
+) {
+    output.clear();
+    output.push([0; MAX_DIM]);
+    for d in 0..dim {
+        let previous = std::mem::take(output);
+        output.reserve(previous.len() * 3);
+        for base in previous {
+            for offset in -1..=1 {
+                if let Some(axis) = neighbor_axis(center[d], offset, grid_res, wrap) {
+                    let mut key = base;
+                    key[d] = axis;
+                    output.push(key);
+                }
+            }
         }
     }
+    output.sort_unstable();
+    output.dedup();
 }
 
 pub fn apply_reactions(state: &mut SimState) {
-    if !state.params.reactions_enabled {
+    if !state.params.reactions_enabled || state.particles.is_empty() {
+        return;
+    }
+    let radius = state.params.scaled_mix_radius();
+    if radius <= 0.0 {
         return;
     }
 
-    let mix_r = state.params.scaled_mix_radius();
-    if mix_r <= 0.0 {
-        return;
-    }
-    let mix_r_sq = mix_r * mix_r;
-    let prob = state.params.reaction_probability;
-    let n = state.params.type_count;
-    let bounds = state.params.bounds;
-    let wrap = state.params.wrap;
     let count = state.particles.len();
-    if count == 0 {
-        return;
-    }
-
-    let mut rng = rand::thread_rng();
-    state.reaction_changes_scratch.clear();
-
-    // Build a FRESH grid from POST-integration positions, sized by the
-    // reaction radius. Three bugs lived here previously:
-    //   1. It reused the force grid built from PRE-integration positions with
-    //      LAST frame's grid_res (stats are written after this fn runs), so
-    //      fast-moving particles — exactly the ones oscillating "objects" are
-    //      made of — were looked up in the wrong cells.
-    //   2. Naive mode never cleared the buckets, so after grid mode ran once,
-    //      "Naive" reactions kept using an ever-staler grid (and stale indices
-    //      could go out of bounds after deletions).
-    //   3. Cells were sized by r_max, but mix_radius is independent and can be
-    //      larger — the 27-cell neighborhood then misses reaction partners.
-    // Now the grid is rebuilt here every call (or skipped for small N), so
-    // reaction pairing is exact in every step mode.
-    let grid_res = choose_grid_res(bounds, mix_r);
-    let use_grid = count >= 1024 && grid_res >= 3;
+    let dim = state.params.dimension;
+    let grid_res = choose_grid_res(state.params.bounds, radius);
+    let use_grid = count >= 1024 && grid_res >= 3 && dim <= MAX_GRID_DIM;
+    let mut changes = std::mem::take(&mut state.reaction_changes_scratch);
+    changes.clear();
+    let mut traces = Vec::new();
 
     if use_grid {
-        let total_cells = grid_res * grid_res * grid_res;
-        state.buckets_scratch.resize_with(total_cells, Vec::new);
-        for b in &mut state.buckets_scratch {
-            b.clear();
-        }
-        for (i, p) in state.particles.iter().enumerate() {
-            let [cx, cy, cz] = cell_coords(p.position, bounds, grid_res, wrap);
-            state.buckets_scratch[cell_index(cx, cy, cz, grid_res)].push(i);
+        let mut buckets = std::mem::take(&mut state.buckets_scratch);
+        buckets.clear();
+        for (i, particle) in state.particles.iter().enumerate() {
+            buckets
+                .entry(cell_coords(
+                    particle.position,
+                    state.params.bounds,
+                    grid_res,
+                    state.params.wrap,
+                    dim,
+                ))
+                .or_default()
+                .push(i);
         }
 
+        let mut keys = Vec::with_capacity(3usize.pow(dim as u32));
+        let mut candidates = Vec::with_capacity(256);
         for i in 0..count {
-            let pi_pos = state.particles[i].position;
-            let ri = state.particles[i].kind as usize;
-            let [cx, cy, cz] = cell_coords(pi_pos, bounds, grid_res, wrap);
-
-            for ox in -1isize..=1 {
-                let Some(nx) = neighbor_axis(cx, ox, grid_res, wrap) else {
-                    continue;
-                };
-                for oy in -1isize..=1 {
-                    let Some(ny) = neighbor_axis(cy, oy, grid_res, wrap) else {
-                        continue;
-                    };
-                    for oz in -1isize..=1 {
-                        let Some(nz) = neighbor_axis(cz, oz, grid_res, wrap) else {
-                            continue;
-                        };
-                        let nid = cell_index(nx, ny, nz, grid_res);
-                        for &j in &state.buckets_scratch[nid] {
-                            if j <= i {
-                                continue; // each pair once
-                            }
-
-                            let pj = &state.particles[j];
-                            let mut dx = pj.position[0] - pi_pos[0];
-                            let mut dy = pj.position[1] - pi_pos[1];
-                            let mut dz = pj.position[2] - pi_pos[2];
-                            if wrap {
-                                dx = wrap_delta(dx, bounds);
-                                dy = wrap_delta(dy, bounds);
-                                dz = wrap_delta(dz, bounds);
-                            }
-                            let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq > mix_r_sq {
-                                continue;
-                            }
-
-                            let rj = pj.kind as usize;
-                            if ri >= n || rj >= n {
-                                continue;
-                            }
-                            let result_ij = state.reaction_table[ri * n + rj];
-                            let result_ji = state.reaction_table[rj * n + ri];
-                            if result_ij >= 0 && rng.gen::<f32>() < prob {
-                                state.reaction_changes_scratch.push((i, result_ij as u32));
-                            }
-                            if result_ji >= 0 && rng.gen::<f32>() < prob {
-                                state.reaction_changes_scratch.push((j, result_ji as u32));
-                            }
-                        }
-                    }
+            let center = cell_coords(
+                state.particles[i].position,
+                state.params.bounds,
+                grid_res,
+                state.params.wrap,
+                dim,
+            );
+            neighbor_keys(center, dim, grid_res, state.params.wrap, &mut keys);
+            candidates.clear();
+            for key in &keys {
+                if let Some(indices) = buckets.get(key) {
+                    candidates.extend(indices.iter().copied().filter(|&j| j > i));
                 }
             }
+            candidates.sort_unstable();
+            candidates.dedup();
+            for &j in &candidates {
+                maybe_react_pair(state, i, j, radius * radius, &mut changes, &mut traces);
+            }
         }
+        state.buckets_scratch = buckets;
     } else {
-        // Naive pairwise (small N, or grid too coarse to be worthwhile)
         for i in 0..count {
             for j in (i + 1)..count {
-                let pi = &state.particles[i];
-                let pj = &state.particles[j];
-                let mut dx = pj.position[0] - pi.position[0];
-                let mut dy = pj.position[1] - pi.position[1];
-                let mut dz = pj.position[2] - pi.position[2];
-                if wrap {
-                    dx = wrap_delta(dx, bounds);
-                    dy = wrap_delta(dy, bounds);
-                    dz = wrap_delta(dz, bounds);
-                }
-                let dist_sq = dx * dx + dy * dy + dz * dz;
-                if dist_sq > mix_r_sq {
-                    continue;
-                }
-                let ri = pi.kind as usize;
-                let rj = pj.kind as usize;
-                if ri >= n || rj >= n {
-                    continue;
-                }
-                let result_ij = state.reaction_table[ri * n + rj];
-                let result_ji = state.reaction_table[rj * n + ri];
-                if result_ij >= 0 && rng.gen::<f32>() < prob {
-                    state.reaction_changes_scratch.push((i, result_ij as u32));
-                }
-                if result_ji >= 0 && rng.gen::<f32>() < prob {
-                    state.reaction_changes_scratch.push((j, result_ji as u32));
-                }
+                maybe_react_pair(state, i, j, radius * radius, &mut changes, &mut traces);
             }
         }
     }
 
-    for (idx, new_kind) in state.reaction_changes_scratch.drain(..) {
-        if idx < state.particles.len() {
-            state.particles[idx].kind = new_kind;
+    for (i, t) in traces {
+        state.trace_timers[i] = state.trace_timers[i].max(t);
+    }
+    for (index, kind) in changes.drain(..) {
+        if let Some(particle) = state.particles.get_mut(index) {
+            particle.kind = kind;
         }
     }
+    state.reaction_changes_scratch = changes;
 }
 
+fn maybe_react_pair(
+    state: &SimState,
+    i: usize,
+    j: usize,
+    radius_sq: f32,
+    changes: &mut Vec<(usize, u32)>,
+    traces: &mut Vec<(usize, u32)>,
+) {
+    let a = &state.particles[i];
+    let b = &state.particles[j];
+    let mut distance_sq = 0.0;
+    for d in 0..state.params.dimension {
+        let raw = b.position[d] - a.position[d];
+        let delta = if state.params.wrap {
+            wrap_delta(raw, state.params.bounds)
+        } else {
+            raw
+        };
+        distance_sq += delta * delta;
+    }
+    if distance_sq > radius_sq {
+        return;
+    }
 
+    let type_count = state.params.type_count;
+    let ai = a.kind as usize;
+    let bi = b.kind as usize;
+    if ai >= type_count || bi >= type_count {
+        return;
+    }
+    let result_ab = state.reaction_table[ai * type_count + bi];
+    let result_ba = state.reaction_table[bi * type_count + ai];
+    if result_ab >= 0
+        && reaction_gate(
+            i as u32,
+            j as u32,
+            state.step_count as u32,
+            state.params.reaction_probability,
+        )
+    {
+        changes.push((i, result_ab as u32));
+        let t = state.trace_len_matrix[ai * type_count + bi];
+        traces.push((i, t));
+        traces.push((j, t));
+    }
+    if result_ba >= 0
+        && reaction_gate(
+            j as u32,
+            i as u32,
+            state.step_count as u32,
+            state.params.reaction_probability,
+        )
+    {
+        changes.push((j, result_ba as u32));
+        let t = state.trace_len_matrix[bi * type_count + ai];
+        traces.push((i, t));
+        traces.push((j, t));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -570,93 +444,118 @@ mod tests {
     use crate::sim::{Particle, SimState};
     use glam::Vec3;
 
-    /// Deterministic pseudo-random f32 in [0, 1) from an integer hash —
-    /// no RNG state, so both sim instances get identical particles.
     fn hash01(seed: u32) -> f32 {
-        let mut h = seed.wrapping_mul(2654435761).wrapping_add(0x9E3779B9);
-        h ^= h >> 16;
-        h = h.wrapping_mul(0x85EBCA6B);
-        h ^= h >> 13;
-        (h & 0x00FF_FFFF) as f32 / 16_777_216.0
+        let mut hash = seed.wrapping_mul(2_654_435_761).wrapping_add(0x9E37_79B9);
+        hash ^= hash >> 16;
+        hash = hash.wrapping_mul(0x85EB_CA6B);
+        hash ^= hash >> 13;
+        (hash & 0x00FF_FFFF) as f32 / 16_777_216.0
     }
 
-    fn build_state(mode: CpuStepMode) -> SimState {
-        let mut s = SimState::new();
-        s.particles.clear(); // SimState::new spawns 512 thread_rng particles
-        s.params.cpu_step_mode = mode;
-        s.params.reactions_enabled = false; // reactions use thread_rng
-        s.params.wrap = true;
-        s.params.bounds = 10.0;
-        // Large enough r_max for a meaningful grid (grid_res >= 3),
-        // large dt/force so particles leapfrog (the regime under study).
-        s.params.r_max = 2.0; // scaled: 2.0 * 10/20 = 1.0 -> grid_res = 10
-        s.params.dt = 0.05;
-        s.params.force_scale = 8.0;
-
-        let n = s.params.type_count;
-        for i in 0..(n * n) {
-            s.force_matrix[i] = hash01(i as u32) * 2.0 - 1.0;
+    fn build_state(mode: CpuStepMode, dimension: usize) -> SimState {
+        let mut state = SimState::new();
+        state.particles.clear();
+        state.params.cpu_step_mode = mode;
+        state.params.dimension = dimension;
+        state.params.reactions_enabled = false;
+        state.params.wrap = true;
+        state.params.bounds = 10.0;
+        state.params.r_max = 2.0;
+        state.params.dt = 0.05;
+        state.params.force_scale = 8.0;
+        for i in 0..state.force_matrix.len() {
+            state.force_matrix[i] = hash01(i as u32) * 2.0 - 1.0;
         }
-        for i in 0..3000u32 {
-            let pos = Vec3::new(
-                hash01(i * 3) * s.params.bounds,
-                hash01(i * 3 + 1) * s.params.bounds,
-                hash01(i * 3 + 2) * s.params.bounds,
+        for i in 0..600u32 {
+            let mut particle = Particle::new(
+                Vec3::new(
+                    hash01(i * 3) * 10.0,
+                    hash01(i * 3 + 1) * 10.0,
+                    hash01(i * 3 + 2) * 10.0,
+                ),
+                i % state.params.type_count as u32,
             );
-            s.particles.push(Particle::new(pos, i % n as u32));
+            for d in 3..dimension {
+                particle.position[d] = hash01(i * MAX_DIM as u32 + d as u32) * 10.0;
+            }
+            state.particles.push(particle);
         }
-        s
+        state
     }
 
-    /// GridExact must produce BIT-IDENTICAL results to Naive: candidates are
-    /// sorted by index before accumulation, so the f32 sums match exactly.
-    /// The period-2 oscillating objects this project studies sit on a
-    /// floating-point knife edge, so "same model, different rounding" would
-    /// still perturb them — this test enforces the stronger guarantee.
     #[test]
-    fn grid_exact_is_bit_identical_to_naive() {
-        let mut naive = build_state(CpuStepMode::Naive);
-        let mut grid = build_state(CpuStepMode::GridExact);
-
-        for step in 0..50 {
-            cpu_step(&mut naive);
-            cpu_step(&mut grid);
-            assert!(naive.last_step_used_grid == false);
-            assert!(grid.last_step_used_grid == true);
-
-            for (i, (a, b)) in naive.particles.iter().zip(grid.particles.iter()).enumerate() {
-                assert_eq!(
-                    a.position.map(f32::to_bits),
-                    b.position.map(f32::to_bits),
-                    "position diverged at step {step}, particle {i}"
-                );
-                assert_eq!(
-                    a.velocity.map(f32::to_bits),
-                    b.velocity.map(f32::to_bits),
-                    "velocity diverged at step {step}, particle {i}"
-                );
+    fn grid_exact_matches_naive_in_3d_and_4d() {
+        for dimension in [3, 4] {
+            let mut naive = build_state(CpuStepMode::Naive, dimension);
+            let mut grid = build_state(CpuStepMode::GridExact, dimension);
+            for step in 0..5 {
+                cpu_step(&mut naive);
+                cpu_step(&mut grid);
+                for (index, (a, b)) in naive.particles.iter().zip(&grid.particles).enumerate() {
+                    assert_eq!(
+                        a.position.map(f32::to_bits),
+                        b.position.map(f32::to_bits),
+                        "position diverged in {dimension}D at step {step}, particle {index}"
+                    );
+                    assert_eq!(a.velocity.map(f32::to_bits), b.velocity.map(f32::to_bits));
+                }
             }
         }
     }
 
-
-    /// Tiny wrapped grids alias neighbor cells; the dedup must prevent
-    /// double-counted forces there too.
     #[test]
-    fn tiny_wrapped_grid_matches_naive() {
-        let mut naive = build_state(CpuStepMode::Naive);
-        let mut grid = build_state(CpuStepMode::GridExact);
-        for s in [&mut naive, &mut grid] {
-            s.params.r_max = 8.0; // scaled 4.0 over bounds 10 -> grid_res = 2 (aliasing regime)
-            s.particles.truncate(600);
+    fn constant_fourth_axis_matches_3d() {
+        let mut three = build_state(CpuStepMode::Naive, 3);
+        let mut four = build_state(CpuStepMode::Naive, 3);
+        four.params.dimension = 4;
+        for _ in 0..5 {
+            cpu_step(&mut three);
+            cpu_step(&mut four);
         }
+        for (a, b) in three.particles.iter().zip(&four.particles) {
+            assert_eq!(a.position[..3], b.position[..3]);
+            assert_eq!(a.velocity[..3], b.velocity[..3]);
+            assert_eq!(b.position[3], 0.0);
+        }
+    }
 
-        for _ in 0..30 {
-            cpu_step(&mut naive);
-            cpu_step(&mut grid);
-        }
-        for (a, b) in naive.particles.iter().zip(grid.particles.iter()) {
-            assert_eq!(a.position.map(f32::to_bits), b.position.map(f32::to_bits));
+    #[test]
+    fn five_dimensional_neighborhood_has_243_cells() {
+        let mut keys = Vec::new();
+        neighbor_keys([5; MAX_DIM], 5, 20, false, &mut keys);
+        assert_eq!(keys.len(), 243);
+    }
+
+    #[test]
+    fn dimensions_above_five_fall_back_to_naive() {
+        let state = build_state(CpuStepMode::GridExact, 6);
+        assert_eq!(
+            resolve_step_mode(&state, state.particles.len()),
+            ResolvedStepMode::Naive
+        );
+    }
+}
+
+pub fn reaction_gate(i: u32, j: u32, frame: u32, probability: f32) -> bool {
+    let mut h = i
+        .wrapping_mul(2654435761)
+        .wrapping_add(j.wrapping_mul(2246822519))
+        .wrapping_add(frame.wrapping_mul(2246822519));
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846ca68b);
+    h ^= h >> 16;
+    probability >= 1.0 || (h & 65535) < (probability.clamp(0.0, 1.0) * 65536.0) as u32
+}
+#[cfg(test)]
+mod reaction_regressions {
+    use super::*;
+    #[test]
+    fn probability_endpoints_are_exact() {
+        for i in 0..1000 {
+            assert!(!reaction_gate(i, i + 1, i, 0.0));
+            assert!(reaction_gate(i, i + 1, i, 1.0));
         }
     }
 }

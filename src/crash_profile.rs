@@ -18,6 +18,7 @@ pub struct CrashProfile {
     paused: bool,
 
     type_count: usize,
+    dimension: usize,
     bounds: f32,
     dt: f32,
     r_max: f32,
@@ -34,6 +35,8 @@ pub struct CrashProfile {
 
     trace_len: u32,
     trace_type_filter: i32,
+    extra_slice_centers: [f32; crate::sim::MAX_DIM],
+    extra_slice_thickness: [f32; crate::sim::MAX_DIM],
 
     last_step_used_grid: bool,
     last_neighbor_checks: u64,
@@ -71,6 +74,7 @@ pub fn save_crash_profile(sim: &SimState, ui: &UiState) {
         paused: ui.paused,
 
         type_count: sim.params.type_count,
+        dimension: sim.params.dimension,
         bounds: sim.params.bounds,
         dt: sim.params.dt,
         r_max: sim.params.r_max,
@@ -87,6 +91,8 @@ pub fn save_crash_profile(sim: &SimState, ui: &UiState) {
 
         trace_len: ui.trace_len,
         trace_type_filter: ui.trace_type_filter,
+        extra_slice_centers: ui.extra_slice_centers,
+        extra_slice_thickness: ui.extra_slice_thickness,
 
         last_step_used_grid: sim.last_step_used_grid,
         last_neighbor_checks: sim.last_neighbor_checks,

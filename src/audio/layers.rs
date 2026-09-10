@@ -22,7 +22,7 @@
 //! same restore, same swing modes — discrete output instead of continuous.
 
 /// What a layer's matrix drives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayerTarget {
     /// The force matrix. Continuous — see `CombineMode`.
     Force,
@@ -52,7 +52,7 @@ impl LayerTarget {
 }
 
 /// How a Force layer's drive lands on the base matrix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CombineMode {
     /// `base + drive * depth`. Cells sitting at zero can come alive.
     Add,
@@ -82,7 +82,7 @@ impl CombineMode {
 }
 
 /// How the band envelope is shaped into a drive value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SwingMode {
     /// Envelope maps to -1..1, so the cell rides above *and* below its base.
     /// Silence parks it at -weight, full level at +weight.
@@ -122,7 +122,7 @@ impl SwingMode {
 }
 
 /// Resolved gate for one reaction cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateState {
     /// No reaction layer weights this cell — it keeps whatever was authored.
     Untouched,
@@ -133,6 +133,7 @@ pub enum GateState {
 }
 
 /// One band → one weight matrix.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BandLayer {
     pub band: usize,
     /// `types * types` cells, each clamped to -1..1. Row-major, same layout as
@@ -173,6 +174,24 @@ pub struct BandLayer {
 }
 
 impl BandLayer {
+    pub fn valid_snapshot(&self) -> bool {
+        let n = self.types;
+        (1..=crate::sim::MAX_TYPES).contains(&n)
+            && self.band < super::BANDS
+            && [&self.weights, &self.out, &self.spring_x, &self.spring_v]
+                .iter()
+                .all(|v| v.len() == n * n && v.iter().all(|x| x.is_finite()))
+            && [
+                self.gain,
+                self.threshold,
+                self.rate,
+                self.stiffness,
+                self.damping,
+                self.phase,
+            ]
+            .iter()
+            .all(|x| x.is_finite())
+    }
     pub fn new(band: usize, types: usize) -> Self {
         Self {
             band,
@@ -200,6 +219,8 @@ impl BandLayer {
     /// at `-weight` in silence, which for a positive-weight cell means the gate
     /// is pinned shut until the band is over halfway up — a confusing default
     /// for something whose whole job is to open and close.
+    #[allow(dead_code)] // constructor kept for parity; the UI promotes an
+                        // existing layer via the target button instead of building one directly.
     pub fn new_reaction(band: usize, types: usize) -> Self {
         let mut l = Self::new(band, types);
         l.target = LayerTarget::Reaction;
@@ -361,6 +382,8 @@ impl LayerOutputs {
     }
 
     /// Any reaction layer weighting any cell this frame?
+    #[allow(dead_code)] // apply() ended up using has_reaction_layers() instead,
+                        // but this is the cheaper per-frame check if that changes.
     pub fn gates_active(&self) -> bool {
         self.gate.iter().any(|g| *g != GateState::Untouched)
     }

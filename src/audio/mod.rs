@@ -10,7 +10,7 @@
 //! disarmed, so audio never eats the user's edits.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
@@ -36,7 +36,14 @@ const BAND_EDGES: [f32; BANDS + 1] = [
 ];
 
 pub const BAND_NAMES: [&str; BANDS] = [
-    "sub", "bass", "low-mid", "mid", "hi-mid", "presence", "brilliance", "air",
+    "sub",
+    "bass",
+    "low-mid",
+    "mid",
+    "hi-mid",
+    "presence",
+    "brilliance",
+    "air",
 ];
 
 // ── Superseded by BandLayer (src/audio/layers.rs) ───────────────────────────
@@ -77,6 +84,18 @@ pub struct AudioMod {
     /// Output gain as f32 bits, read by the audio callback. Muting only affects
     /// what you hear — analysis always runs on the decoded samples.
     gain: Arc<AtomicU32>,
+    /// Sample index of a pending seek, or -1 when none is pending. The
+    /// running cpal callback polls this each buffer and jumps its internal
+    /// fractional position when set, since it otherwise only ever writes
+    /// `playhead` (never re-reads it), which used to make `seek_secs` a no-op
+    /// while a track was playing.
+    seek_request: Arc<AtomicI64>,
+    /// Mirrors `looping` for the cpal callback thread. `looping` itself is a
+    /// plain bool the UI checkbox writes directly; without a shared atomic,
+    /// toggling loop while a track is already playing had no effect because
+    /// the callback closure had captured the old value by copy at stream-build
+    /// time.
+    looping_shared: Arc<AtomicBool>,
     pub playing: bool,
     pub muted: bool,
     pub volume: f32,
@@ -116,6 +135,11 @@ pub struct AudioMod {
     base_prob: f32,
     /// Last force values we actually wrote, for slew limiting.
     applied: Vec<f32>,
+    /// Whether a reaction layer existed as of the previous `apply()` call, so
+    /// we can detect the transition to "no reaction layers" and restore the
+    /// authored table/probability once instead of leaving them frozen at
+    /// whatever a since-removed layer last wrote.
+    had_reaction_layers: bool,
 }
 
 impl AudioMod {
@@ -139,6 +163,8 @@ impl AudioMod {
             playhead: Arc::new(AtomicUsize::new(0)),
             stream: None,
             gain: Arc::new(AtomicU32::new(0.8f32.to_bits())),
+            seek_request: Arc::new(AtomicI64::new(-1)),
+            looping_shared: Arc::new(AtomicBool::new(true)),
             playing: false,
             muted: false,
             volume: 0.8,
@@ -154,7 +180,9 @@ impl AudioMod {
             release: 0.18,
 
             armed: false,
-            depth: 0.15,
+            // 0.15 made Add and Scale differ by roughly 1% of a cell at typical
+            // band levels — both worked, neither showed. 0.5 is visible.
+            depth: 0.5,
             smoothing: 0.85,
             layers: Vec::new(),
             outputs: LayerOutputs::new(),
@@ -166,6 +194,7 @@ impl AudioMod {
             base_rx: Vec::new(),
             base_prob: 0.1,
             applied: Vec::new(),
+            had_reaction_layers: false,
         }
     }
 
@@ -183,8 +212,13 @@ impl AudioMod {
 
     pub fn seek_secs(&mut self, t: f32) {
         let idx = (t.max(0.0) * self.sample_rate as f32) as usize;
-        self.playhead
-            .store(idx.min(self.samples.len().saturating_sub(1)), Ordering::Relaxed);
+        let idx = idx.min(self.samples.len().saturating_sub(1));
+        self.playhead.store(idx, Ordering::Relaxed);
+        // The running cpal callback (if any) tracks its own fractional
+        // position and only ever writes `playhead`, so a seek during
+        // playback would otherwise be silently overwritten by the very next
+        // audio callback. This flag is what the callback polls to jump.
+        self.seek_request.store(idx as i64, Ordering::Relaxed);
     }
 
     // ── Loading ─────────────────────────────────────────────────────────────
@@ -240,12 +274,15 @@ impl AudioMod {
             return;
         }
         self.push_gain();
+        self.looping_shared.store(self.looping, Ordering::Relaxed);
+        self.seek_request.store(-1, Ordering::Relaxed);
         match build_stream(
             self.samples.clone(),
             self.sample_rate,
             self.playhead.clone(),
             self.gain.clone(),
-            self.looping,
+            self.seek_request.clone(),
+            self.looping_shared.clone(),
         ) {
             Ok(s) => {
                 self.stream = Some(s);
@@ -254,8 +291,9 @@ impl AudioMod {
             Err(e) => {
                 // No output device is not fatal — we can still analyze silently by
                 // advancing the playhead ourselves in update().
-                self.load_error =
-                    Some(format!("audio output unavailable: {e} (analyzing silently)"));
+                self.load_error = Some(format!(
+                    "audio output unavailable: {e} (analyzing silently)"
+                ));
                 self.playing = true;
             }
         }
@@ -284,6 +322,13 @@ impl AudioMod {
 
     /// Run one analysis frame. `dt` is the render frame time in seconds.
     pub fn analyze(&mut self, dt: f32) {
+        // Keep the running stream's loop behavior in sync with the checkbox.
+        // `looping` is a plain bool the UI mutates directly (no setter to hook
+        // a push from), so this per-frame mirror is what makes toggling it
+        // during playback actually take effect instead of only applying the
+        // next time play() rebuilds the stream.
+        self.looping_shared.store(self.looping, Ordering::Relaxed);
+
         if !self.has_file() {
             for b in 0..BANDS {
                 self.band_env[b] *= 0.9;
@@ -344,6 +389,11 @@ impl AudioMod {
         // so quiet passages still produce usable motion.
         let atk = 1.0 - (-dt / self.attack.max(1e-4)).exp();
         let rel = 1.0 - (-dt / self.release.max(1e-4)).exp();
+        // Same dt*60 convention as the force-matrix slew above: this was a
+        // flat 0.9995-per-call decay, so the peak (and therefore band
+        // sensitivity) recovered from a loud passage several times faster at
+        // high frame rates than at low ones for the same track.
+        let peak_decay = 0.9995_f32.powf(dt * 60.0);
 
         for b in 0..BANDS {
             let v = if counts[b] > 0 {
@@ -354,7 +404,9 @@ impl AudioMod {
             let coef = if v > self.band_env[b] { atk } else { rel };
             self.band_env[b] += (v - self.band_env[b]) * coef;
 
-            self.band_peak[b] = (self.band_peak[b] * 0.9995).max(self.band_env[b]).max(1e-4);
+            self.band_peak[b] = (self.band_peak[b] * peak_decay)
+                .max(self.band_env[b])
+                .max(1e-4);
             self.bands[b] = (self.band_env[b] / self.band_peak[b]).clamp(0.0, 1.0);
         }
     }
@@ -418,6 +470,7 @@ impl AudioMod {
             l.reset_state();
         }
         self.armed = true;
+        self.had_reaction_layers = self.has_reaction_layers();
     }
 
     pub fn disarm(&mut self, sim: &mut crate::sim::SimState) {
@@ -452,11 +505,19 @@ impl AudioMod {
         accumulate(&mut self.layers, &self.bands, n, dt, &mut outputs);
 
         // ── Force matrix ────────────────────────────────────────────────
-        let keep = self.smoothing.clamp(0.0, 0.99);
+        // `smoothing` is authored as a per-frame-at-60fps retention factor;
+        // raising it to the dt*60 power (same convention as the friction
+        // damping in sim/physics.rs) keeps the actual glide time constant
+        // regardless of the render frame rate instead of settling ~5x faster
+        // at 144fps than at 30fps for the same slider value.
+        let keep = self.smoothing.clamp(0.0, 0.99).powf(dt * 60.0);
         let depth = self.depth;
 
         for i in 0..n * n {
-            let scaled = self.base[i] * (1.0 + outputs.scale[i] * depth);
+            // Scale gets double headroom: depth 1.0 is a full-range additive
+            // shift but only a 2x multiplier, so sharing one slider makes Scale
+            // feel dead next to Add. This puts its span at roughly 0x..3x.
+            let scaled = self.base[i] * (1.0 + outputs.scale[i] * depth * 2.0);
             let target = (scaled + outputs.add[i] * depth).clamp(-1.0, 1.0);
             self.applied[i] += (target - self.applied[i]) * (1.0 - keep);
         }
@@ -472,7 +533,8 @@ impl AudioMod {
         // arming the audio would lock the Reactions tab out of editing.
         // No slew here — a gate is on or off, and easing it would just
         // produce a frame or two of a wrong reaction product.
-        if self.has_reaction_layers() && self.base_rx.len() == n * n {
+        let has_reaction_layers = self.has_reaction_layers();
+        if has_reaction_layers && self.base_rx.len() == n * n {
             for i in 0..n {
                 for j in 0..n {
                     let idx = i * n + j;
@@ -485,17 +547,40 @@ impl AudioMod {
                 }
             }
 
-            if let Some(rate) = outputs.rate {
-                sim.set_reaction_probability((self.base_prob + rate * depth).clamp(0.0, 1.0));
+            // Restore to base whenever nothing is driving rate this frame, so
+            // a layer with "drive rate" unticked (or removed) doesn't leave
+            // reaction_probability pinned at its last driven value forever.
+            let prob = match outputs.rate {
+                Some(rate) => self.base_prob + rate * depth,
+                None => self.base_prob,
+            };
+            sim.set_reaction_probability(prob.clamp(0.0, 1.0));
+        } else if self.had_reaction_layers && self.base_rx.len() == n * n {
+            // The last reaction-targeting layer was just disabled/removed
+            // while still armed. Without this, cells it gated closed (-1)
+            // would stay stuck forever since nothing writes the table once
+            // `has_reaction_layers()` goes false. Restore once, then leave the
+            // table alone again so manual edits in the Reactions tab aren't
+            // fought every frame.
+            for i in 0..n {
+                for j in 0..n {
+                    sim.set_reaction(i, j, self.base_rx[i * n + j]);
+                }
             }
+            sim.set_reaction_probability(self.base_prob);
         }
+        self.had_reaction_layers = has_reaction_layers;
 
         self.outputs = outputs;
     }
 
     /// Publish the current mute/volume state to the audio callback.
     pub fn push_gain(&self) {
-        let g = if self.muted { 0.0 } else { self.volume.clamp(0.0, 1.0) };
+        let g = if self.muted {
+            0.0
+        } else {
+            self.volume.clamp(0.0, 1.0)
+        };
         self.gain.store(g.to_bits(), Ordering::Relaxed);
     }
 
@@ -628,7 +713,8 @@ fn build_stream(
     src_rate: u32,
     playhead: Arc<AtomicUsize>,
     gain: Arc<AtomicU32>,
-    looping: bool,
+    seek_request: Arc<AtomicI64>,
+    looping: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -657,11 +743,23 @@ fn build_stream(
             let samples = samples.clone();
             let playhead = playhead.clone();
             let gain = gain.clone();
+            let seek_request = seek_request.clone();
+            let looping = looping.clone();
             device
                 .build_output_stream(
                     &config,
                     move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
+                        // Pick up a pending seek. `pos` is otherwise entirely
+                        // internal to this callback (only ever written to
+                        // `playhead`, never read back from it), so without
+                        // this a seek requested while playing was silently
+                        // overwritten by the very next callback.
+                        let requested = seek_request.swap(-1, Ordering::Relaxed);
+                        if requested >= 0 {
+                            pos = requested as f64;
+                        }
                         let g = f32::from_bits(gain.load(Ordering::Relaxed));
+                        let loop_enabled = looping.load(Ordering::Relaxed);
                         for frame in data.chunks_mut(channels) {
                             let i = pos as usize;
                             let s = if i + 1 < len {
@@ -677,14 +775,15 @@ fn build_stream(
                             }
                             pos += step;
                             if pos as usize >= len {
-                                if looping {
+                                if loop_enabled {
                                     pos = 0.0;
                                 } else {
                                     pos = (len.saturating_sub(1)) as f64;
                                 }
                             }
                         }
-                        playhead.store((pos as usize).min(len.saturating_sub(1)), Ordering::Relaxed);
+                        playhead
+                            .store((pos as usize).min(len.saturating_sub(1)), Ordering::Relaxed);
                     },
                     err_fn,
                     None,
@@ -697,11 +796,107 @@ fn build_stream(
         cpal::SampleFormat::F32 => make!(f32, |s: f32| s),
         cpal::SampleFormat::I16 => make!(i16, |s: f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
         cpal::SampleFormat::U16 => {
-            make!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0) as u16)
+            make!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0)
+                as u16)
         }
         f => return Err(format!("unsupported sample format {f:?}")),
     };
 
     stream.play().map_err(|e| format!("stream.play: {e}"))?;
     Ok(stream)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioSnapshot {
+    position: f32,
+    path: Option<PathBuf>,
+    muted: bool,
+    volume: f32,
+    looping: bool,
+    attack: f32,
+    release: f32,
+    armed: bool,
+    depth: f32,
+    smoothing: f32,
+    layers: Vec<BandLayer>,
+    base: Vec<f32>,
+    base_types: usize,
+    base_rx: Vec<i32>,
+    base_prob: f32,
+    applied: Vec<f32>,
+    had_reaction_layers: bool,
+    bands: [f32; BANDS],
+    band_env: [f32; BANDS],
+    band_peak: [f32; BANDS],
+}
+impl AudioSnapshot {
+    pub fn validate(&self, types: usize) -> Result<(), String> {
+        if self.layers.len() > 256 || self.layers.iter().any(|l| !l.valid_snapshot()) {
+            return Err("Invalid audio layers".into());
+        }
+        if self.armed
+            && (self.base.len() != types * types
+                || self.base_rx.len() != types * types
+                || self.applied.len() != types * types
+                || self.base_types != types)
+        {
+            return Err("Invalid audio base matrices".into());
+        }
+        Ok(())
+    }
+}
+impl AudioMod {
+    pub fn snapshot(&self) -> AudioSnapshot {
+        AudioSnapshot {
+            position: self.position_secs(),
+            path: self.path.clone(),
+            muted: self.muted.clone(),
+            volume: self.volume.clone(),
+            looping: self.looping.clone(),
+            attack: self.attack.clone(),
+            release: self.release.clone(),
+            armed: self.armed.clone(),
+            depth: self.depth.clone(),
+            smoothing: self.smoothing.clone(),
+            layers: self.layers.clone(),
+            base: self.base.clone(),
+            base_types: self.base_types.clone(),
+            base_rx: self.base_rx.clone(),
+            base_prob: self.base_prob.clone(),
+            applied: self.applied.clone(),
+            had_reaction_layers: self.had_reaction_layers.clone(),
+            bands: self.bands.clone(),
+            band_env: self.band_env.clone(),
+            band_peak: self.band_peak.clone(),
+        }
+    }
+    pub fn restore_snapshot(&mut self, s: AudioSnapshot) {
+        self.pause();
+        if self.path != s.path {
+            *self = Self::new();
+            if let Some(path) = &s.path {
+                self.load_path(path);
+            }
+        }
+        self.seek_secs(s.position);
+        self.muted = s.muted;
+        self.volume = s.volume;
+        self.looping = s.looping;
+        self.attack = s.attack;
+        self.release = s.release;
+        self.armed = s.armed;
+        self.depth = s.depth;
+        self.smoothing = s.smoothing;
+        self.layers = s.layers;
+        self.base = s.base;
+        self.base_types = s.base_types;
+        self.base_rx = s.base_rx;
+        self.base_prob = s.base_prob;
+        self.applied = s.applied;
+        self.had_reaction_layers = s.had_reaction_layers;
+        self.bands = s.bands;
+        self.band_env = s.band_env;
+        self.band_peak = s.band_peak;
+        self.push_gain();
+    }
 }

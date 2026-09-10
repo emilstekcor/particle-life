@@ -1,55 +1,33 @@
 [package]
-name = "particle_life_3d"
-version = "0.1.0"
+name = "particle-life-hyperdimensional"
+version = "0.3.0"
 edition = "2021"
+description = "GPU-accelerated particle-life simulation with runtime 3D-8D physics"
+license = "MIT"
 
 [dependencies]
-# Window creation and event loop
-winit = "0.29"
-
-# GPU / compute shaders
-wgpu = "0.19"
-
-# UI panels
-egui = "0.26"
-egui-wgpu = "0.26"
-egui-winit = "0.26"
-
-# Math (vectors, matrices)
-glam = "0.25"
-
-# Safe byte casting for GPU buffers
-bytemuck = { version = "1.15", features = ["derive"] }
-
-# Serialization for book.json
+bytemuck = { version = "1.16", features = ["derive"] }
+cpal = "0.15"
+dirs = "5"
+egui = "0.27"
+egui-wgpu = "0.27"
+egui-winit = "0.27"
+env_logger = "0.11"
+glam = "0.27"
+log = "0.4"
+pollster = "0.3"
+rand = "0.8"
+rfd = "0.14"
+rustfft = "6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Random number generation (particle spawning)
-rand = "0.8"
-
-# User data directories
-dirs = "5"
-
-# Async runtime (wgpu needs it for init)
-pollster = "0.3"
-
-# Audio decoding (mp3/wav/flac/ogg/m4a/mp4 container)
 symphonia = { version = "0.5", features = ["all"] }
-
-# Spectrum analysis
-rustfft = "6"
-
-# Audio playback
-cpal = "0.15"
-
-# Native file picker
-rfd = "0.14"
-
-# Logging
-log = "0.4"
-env_logger = "0.11"
+wgpu = "0.19"
+winit = "0.29"
 
 [profile.release]
-opt-level = 3
+lto = "thin"
+codegen-units = 1
 
+[dev-dependencies]
+naga = { version = "0.19", features = ["wgsl-in"] }

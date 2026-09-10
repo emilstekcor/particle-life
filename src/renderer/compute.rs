@@ -1,11 +1,27 @@
-use crate::sim::{GpuParticle, SimParams};
+use crate::sim::{GpuParticle, SimParams, MAX_DIM, MAX_TYPES};
 use std::mem;
-
-pub const MAX_TYPES: usize = 32;
 
 /// Maximum trail history length. The trail history buffer is allocated for
 /// this many points per particle, so every slider/clamp must agree with it.
 pub const MAX_TRAIL: u32 = 20;
+
+/// Bytes needed for a tightly packed trail-history storage buffer.
+pub fn trail_history_size(max_particles: usize, trail_len: u32) -> u64 {
+    (max_particles as u64)
+        .saturating_mul(trail_len as u64)
+        .saturating_mul(std::mem::size_of::<TrailPoint>() as u64)
+}
+
+/// Largest trail length that fits in one storage-buffer binding on this device.
+pub fn max_trail_for_binding(binding_limit: u32, max_particles: usize) -> u32 {
+    let bytes_per_history_slot =
+        (max_particles as u64).saturating_mul(std::mem::size_of::<TrailPoint>() as u64);
+    if bytes_per_history_slot == 0 {
+        return MAX_TRAIL;
+    }
+
+    ((binding_limit as u64 / bytes_per_history_slot).clamp(1, MAX_TRAIL as u64)) as u32
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -23,9 +39,11 @@ pub struct GpuParams {
     pub reactions_enabled: u32,
     pub mix_radius: f32,
     pub reaction_probability: f32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    /// sim.step_count. Feeds the GPU reaction gate so it varies per step while
+    /// staying deterministic and reproducible.
+    pub frame: u32,
+    pub dimension: u32,
+    pub grid_res: u32,
 }
 
 #[repr(C)]
@@ -35,8 +53,13 @@ pub struct SelectionParams {
     pub mode_flags: [u32; 4],     // x = mode (0 none, 1 rect, 2 brush, 3 slice), y = particle count
     pub rect_min: [f32; 4],       // xy = rect min in egui points
     pub rect_max: [f32; 4],       // xy = rect max in egui points
-    pub brush_data: [f32; 4],     // rect/brush: xy center + z radius (points); slice: z thickness + w center (world)
-    pub viewport: [f32; 4],       // xy = viewport size in egui points
+    pub brush_data: [f32; 4], // rect/brush: xy center + z radius (points); slice: z thickness + w center (world)
+    pub viewport: [f32; 4],   // xy = viewport size in egui points
+    pub slice_centers: [f32; MAX_DIM],
+    pub slice_thickness: [f32; MAX_DIM],
+    pub dimension_data: [u32; 4],
+    pub projection: [[f32; 4]; 16],
+    pub projection_data: [f32; 4],
 }
 
 impl Default for SelectionParams {
@@ -48,6 +71,11 @@ impl Default for SelectionParams {
             rect_max: [0.0; 4],
             brush_data: [0.0; 4],
             viewport: [1.0, 1.0, 0.0, 0.0],
+            slice_centers: [0.0; MAX_DIM],
+            slice_thickness: [f32::MAX; MAX_DIM],
+            dimension_data: [3, 0, 0, 0],
+            projection: crate::multidim::ViewNd::default().packed(3),
+            projection_data: [0.0; 4],
         }
     }
 }
@@ -55,8 +83,10 @@ impl Default for SelectionParams {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TrailPoint {
-    pub pos_radius: [f32; 4],    // xyz + radius/type/etc
-    pub color_timer: [u32; 4],  // color + timer data
+    pub position: [f32; MAX_DIM],
+    pub kind: u32,
+    pub timer: u32,
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -69,7 +99,7 @@ pub struct TrailParams {
     pub enabled: u32,
     pub type_filter: i32,
     pub trigger_only: u32,
-    pub _pad0: u32,
+    pub fade_alpha: f32,
 }
 
 impl From<&SimParams> for GpuParams {
@@ -94,16 +124,34 @@ impl From<&SimParams> for GpuParams {
             reactions_enabled: if params.reactions_enabled { 1 } else { 0 },
             mix_radius: params.mix_radius,
             reaction_probability: params.reaction_probability,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            frame: 0, // set explicitly at upload from sim.step_count
+            dimension: params.dimension as u32,
+            grid_res: {
+                let radius = if params.reactions_enabled {
+                    params.r_max.max(params.mix_radius)
+                } else {
+                    params.r_max
+                };
+                let res = if radius > 0.0 {
+                    (params.bounds / radius).floor().clamp(1.0, 64.0) as u32
+                } else {
+                    0
+                };
+                if params.gpu_grid && res >= 3 {
+                    res
+                } else {
+                    0
+                }
+            },
         }
     }
 }
 
 pub struct ComputePipeline {
     pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    reaction_pipeline: wgpu::ComputePipeline,
+    grid_clear_pipeline: wgpu::ComputePipeline,
+    grid_build_pipeline: wgpu::ComputePipeline,
     pub compute_bind_groups: [wgpu::BindGroup; 2],
 
     pub particle_buffers: [wgpu::Buffer; 2], // ping-pong particle buffers
@@ -115,7 +163,6 @@ pub struct ComputePipeline {
     reaction_buf: wgpu::Buffer,      // reaction table (i32 per type pair)
     pub trace_len_buf: wgpu::Buffer, // trace length matrix (u32 per type pair)
     pub trace_timer_buf: wgpu::Buffer, // trace timers (u32 per particle)
-    pub trace_prev_pos_buf: wgpu::Buffer, // trace previous positions (vec3 per particle)
     pub selection_buf: wgpu::Buffer, // selection flags (1 byte per particle)
     selection_params_buf: wgpu::Buffer, // selection parameters
     readback_buf: wgpu::Buffer,      // staging buffer for GPU->CPU particle readback
@@ -132,6 +179,7 @@ pub struct ComputePipeline {
     trail_capture_bind_group: wgpu::BindGroup,
 
     pub trail_len: u32,
+    pub max_trail: u32,
     pub trail_head: u32,
     pub trail_valid_len: u32,
     pub trail_type_filter: i32,
@@ -279,6 +327,32 @@ impl ComputePipeline {
             entry_point: "main",
         });
 
+        let reaction_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Reaction pass"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "react",
+        });
+        let grid_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Clear grid"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "clear_grid",
+            });
+        let grid_build_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Build grid"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "build_grid",
+            });
+        let grid_heads_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid heads"),
+            size: 64 * 64 * 64 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         // Create two particle buffers for ping-pong
         let particle_buffers = [
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -341,10 +415,11 @@ impl ComputePipeline {
             mapped_at_creation: false,
         });
 
-        // Create trace previous position buffer (vec3 per particle)
-        let trace_prev_pos_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Trace Prev Position Buffer"),
-            size: (max_particles * std::mem::size_of::<[f32; 3]>()) as u64,
+        // Storage arrays give vec3 a 16-byte stride, so allocate vec4-sized
+        // slots even though the trace logic only consumes XYZ.
+        let grid_next_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Next Buffer"),
+            size: (max_particles * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -355,7 +430,7 @@ impl ComputePipeline {
             size: (max_particles * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE   // selection.wgsl writes flags
                 | wgpu::BufferUsages::COPY_DST   // clear_selection zeroes it
-                | wgpu::BufferUsages::COPY_SRC,  // readback_selection copies out
+                | wgpu::BufferUsages::COPY_SRC, // readback_selection copies out
             mapped_at_creation: false,
         });
 
@@ -428,13 +503,12 @@ impl ComputePipeline {
                 push_constant_ranges: &[],
             });
 
-        let selection_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Selection Pipeline"),
-                layout: Some(&selection_pipeline_layout),
-                module: &selection_shader,
-                entry_point: "main",
-            });
+        let selection_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Selection Pipeline"),
+            layout: Some(&selection_pipeline_layout),
+            module: &selection_shader,
+            entry_point: "main",
+        });
 
         // One bind group per particle buffer so the pass always reads whichever
         // buffer currently holds the freshest particle data.
@@ -459,12 +533,24 @@ impl ComputePipeline {
             })
         });
 
-        // Create trail buffers, sized for the maximum trail length
+        // Fit trail history to the storage-binding limit granted by the
+        // adapter. Renderer::new requests the full 20-slot size where the
+        // hardware supports it; lower-limit adapters receive a safe cap.
+        let max_trail = max_trail_for_binding(
+            device.limits().max_storage_buffer_binding_size,
+            max_particles,
+        );
+        let trail_history_bytes = trail_history_size(max_particles, max_trail);
+        log::info!(
+            "trail history: {} slots, {} bytes (binding limit {} bytes)",
+            max_trail,
+            trail_history_bytes,
+            device.limits().max_storage_buffer_binding_size
+        );
+
         let trail_history_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Trail History Buffer"),
-            size: (max_particles as u64)
-                * (MAX_TRAIL as u64)
-                * (std::mem::size_of::<TrailPoint>() as u64),
+            size: trail_history_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -594,7 +680,7 @@ impl ComputePipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: selection_buf.as_entire_binding(),
+                        resource: grid_heads_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
@@ -614,7 +700,7 @@ impl ComputePipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
-                        resource: trace_prev_pos_buf.as_entire_binding(),
+                        resource: grid_next_buf.as_entire_binding(),
                     },
                 ],
             }),
@@ -641,7 +727,7 @@ impl ComputePipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: selection_buf.as_entire_binding(),
+                        resource: grid_heads_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
@@ -661,7 +747,7 @@ impl ComputePipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
-                        resource: trace_prev_pos_buf.as_entire_binding(),
+                        resource: grid_next_buf.as_entire_binding(),
                     },
                 ],
             }),
@@ -669,7 +755,9 @@ impl ComputePipeline {
 
         Self {
             pipeline,
-            bind_group_layout,
+            reaction_pipeline,
+            grid_clear_pipeline,
+            grid_build_pipeline,
             compute_bind_groups,
             particle_buffers,
             particle_read_index: 0,
@@ -679,7 +767,6 @@ impl ComputePipeline {
             reaction_buf,
             trace_len_buf,
             trace_timer_buf,
-            trace_prev_pos_buf,
             selection_buf,
             selection_params_buf,
             readback_buf,
@@ -690,7 +777,8 @@ impl ComputePipeline {
             trail_capture_pipeline,
             trail_capture_bind_group_layout,
             trail_capture_bind_group,
-            trail_len: 16,
+            trail_len: 16.min(max_trail),
+            max_trail,
             trail_head: 0,
             trail_valid_len: 0,
             trail_type_filter: -1,
@@ -725,6 +813,35 @@ impl ComputePipeline {
         cpass.dispatch_workgroups(workgroups, 1, 1);
     }
 
+    pub fn dispatch_grid(&self, encoder: &mut wgpu::CommandEncoder, count: u32, res: u32) {
+        if res < 3 || count == 0 {
+            return;
+        }
+        for (pipeline, groups) in [
+            (&self.grid_clear_pipeline, (res * res * res + 63) / 64),
+            (&self.grid_build_pipeline, (count + 63) / 64),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Neighbor grid"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, self.current_compute_bind_group(), &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+    }
+    pub fn dispatch_reactions(&self, encoder: &mut wgpu::CommandEncoder, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Reactions"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.reaction_pipeline);
+        pass.set_bind_group(0, self.current_compute_bind_group(), &[]);
+        pass.dispatch_workgroups((count + 63) / 64, 1, 1);
+    }
     /// Run the dedicated selection pass against the current particle buffer.
     /// `mode` is SelectionParams::mode_flags[0]; pass it so we can skip the
     /// dispatch entirely when no selection tool is active (mode 0 preserves
@@ -739,7 +856,11 @@ impl ComputePipeline {
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.selection_pipeline);
-        cpass.set_bind_group(0, &self.selection_bind_groups[self.particle_read_index], &[]);
+        cpass.set_bind_group(
+            0,
+            &self.selection_bind_groups[self.particle_read_index],
+            &[],
+        );
         cpass.dispatch_workgroups(workgroups, 1, 1);
     }
 
@@ -927,7 +1048,7 @@ impl ComputePipeline {
         Ok(selected_indices)
     }
 
-    pub fn upload_trail_params(&self, queue: &wgpu::Queue, trigger_only: bool) {
+    pub fn upload_trail_params(&self, queue: &wgpu::Queue, trigger_only: bool, fade_alpha: f32) {
         let params = TrailParams {
             particle_count: self.particle_count,
             trail_len: self.trail_len,
@@ -936,7 +1057,7 @@ impl ComputePipeline {
             enabled: self.trails_enabled as u32,
             type_filter: self.trail_type_filter,
             trigger_only: if trigger_only { 1 } else { 0 },
-            _pad0: 0,
+            fade_alpha: fade_alpha.clamp(0.0, 1.0),
         };
         queue.write_buffer(&self.trail_params_buf, 0, bytemuck::bytes_of(&params));
     }
@@ -996,11 +1117,6 @@ impl ComputePipeline {
         self.trail_valid_len = 0;
     }
 
-    pub fn clear_trace_timers(&self, encoder: &mut wgpu::CommandEncoder, max_particles: usize) {
-        let size = (max_particles * std::mem::size_of::<u32>()) as u64;
-        encoder.clear_buffer(&self.trace_timer_buf, 0, Some(size));
-    }
-
     pub fn clear_trail_history(&self, encoder: &mut wgpu::CommandEncoder, max_particles: usize) {
         let size =
             (max_particles * (self.trail_len as usize) * std::mem::size_of::<TrailPoint>()) as u64;
@@ -1010,5 +1126,23 @@ impl ComputePipeline {
     }
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
 
+    #[test]
+    fn uniforms_and_storage_match_wgsl() {
+        assert_eq!(std::mem::size_of::<GpuParams>(), 64);
+        assert_eq!(std::mem::size_of::<SelectionParams>(), 496);
+        assert_eq!(std::mem::size_of::<TrailPoint>(), 48);
+        assert_eq!(std::mem::size_of::<TrailParams>(), 32);
+    }
 
+    #[test]
+    fn trail_history_respects_binding_limit() {
+        assert_eq!(trail_history_size(200_000, 20), 192_000_000);
+        assert_eq!(max_trail_for_binding(134_217_728, 200_000), 13);
+        assert!(trail_history_size(200_000, 13) <= 134_217_728);
+        assert_eq!(max_trail_for_binding(192_000_000, 200_000), 20);
+    }
+}

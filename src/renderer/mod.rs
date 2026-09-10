@@ -59,6 +59,7 @@ pub struct Renderer {
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
+    last_gpu_physics: bool,
 }
 
 impl Renderer {
@@ -98,9 +99,9 @@ impl Renderer {
     /// Refresh the CPU particle mirror from the current GPU buffer.
     /// Preserves CPU-only fields (`prefab_local_type`) and does NOT set
     /// `particles_dirty` — the GPU already has this exact data.
-    pub fn sync_particles_from_gpu(&mut self, sim: &mut SimState) {
+    pub fn sync_particles_from_gpu(&mut self, sim: &mut SimState) -> bool {
         if self.compute.particle_count == 0 {
-            return;
+            return true;
         }
         match self.compute.readback_particles(&self.device, &self.queue) {
             Ok(gpu_particles) => {
@@ -110,9 +111,11 @@ impl Renderer {
                     p.kind = g.kind; // GPU reactions can change kind
                     p.prefab_id = g.prefab_id;
                 }
+                true
             }
             Err(e) => {
                 log::warn!("Failed to read back particles: {:?}", e);
+                false
             }
         }
     }
@@ -144,13 +147,26 @@ impl Renderer {
 
         log::info!("GPU: {:?}", adapter.get_info().name);
 
+        // The complete 200k-particle × 20-sample trail history is 192 MB.
+        // WGPU's portable default only grants 128 MiB per storage binding even
+        // when the adapter supports more, so request the usable amount here.
+        // ComputePipeline still derives a smaller safe trail cap when an
+        // adapter genuinely cannot expose the complete history.
+        let adapter_limits = adapter.limits();
+        let desired_trail_binding_size =
+            compute::trail_history_size(crate::sim::MAX_RENDER_PARTICLES, compute::MAX_TRAIL);
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffer_binding_size = adapter_limits
+            .max_storage_buffer_binding_size
+            .min(desired_trail_binding_size.min(u32::MAX as u64) as u32);
+
         // Device = logical GPU handle. Queue = command submission queue.
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Main Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                 },
                 None,
             )
@@ -204,6 +220,7 @@ impl Renderer {
             egui_ctx,
             egui_renderer,
             egui_state,
+            last_gpu_physics: true,
         }
     }
 
@@ -253,29 +270,78 @@ impl Renderer {
             pixels_per_point: window.scale_factor() as f32,
         };
 
-        // 0) Complete any pending selection readback from last frame, and keep
-        //    the CPU particle mirror fresh while a selection is being edited
-        //    under GPU physics. This runs BEFORE egui so the UI acts on
-        //    current data this frame. The blocking readback only happens while
-        //    a selection exists, not during normal simulation.
+        // Every CPU edit transaction starts from current GPU state. Never
+        // read back after editing: deletion can change index ownership.
+        let raw_input = self.egui_state.take_egui_input(window);
+        let interacting = !raw_input.events.is_empty();
+        if self.last_gpu_physics
+            && (interacting
+                || ui.drag_mode == crate::ui::DragMode::MovingSelection
+                || ui.session.needs_live_state()
+                || ui.selection_readback_needed)
+        {
+            if !self.sync_particles_from_gpu(sim) {
+                ui.flash("GPU synchronization failed; edit was not applied");
+                return;
+            }
+        }
         if ui.selection_readback_needed {
             self.sync_selection(sim, ui);
-        } else if ui.use_gpu_physics
-            && !ui.paused
-            && !ui.selected_indices.is_empty()
-            && ui.drag_mode != crate::ui::DragMode::MovingSelection
-        {
-            self.sync_particles_from_gpu(sim);
         }
-
-        // 1) Run egui first so ui state is current for this frame
-        let raw_input = self.egui_state.take_egui_input(window);
+        let before_edit = if interacting {
+            Some(crate::session::Snapshot::capture(sim, ui))
+        } else {
+            None
+        };
+        ui.trace_len_limit = self.compute.max_trail;
+        ui.trace_len = ui.trace_len.clamp(1, ui.trace_len_limit);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             crate::ui::draw_ui(ctx, sim, ui);
         });
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
+
+        if let Some(snapshot) = before_edit {
+            if (sim.particles_dirty
+                || sim.params_dirty
+                || sim.force_matrix_dirty
+                || sim.reaction_table_dirty
+                || sim.trace_len_matrix_dirty
+                || ui.pending_dimension.is_some())
+                && !ui.session.undo_requested
+                && !ui.session.redo_requested
+            {
+                ui.session.push_undo(snapshot);
+            }
+        }
+        crate::session::process(sim, ui);
+        if self.last_gpu_physics != ui.use_gpu_physics {
+            sim.trace_timers = vec![0; sim.particles.len()];
+            sim.particles_dirty = true;
+            sim.particles_replaced = true;
+        }
+        self.last_gpu_physics = ui.use_gpu_physics;
+
+        // Dimension changes need a current CPU mirror before initializing new
+        // axes; otherwise a stale mirror would rewind GPU-owned XYZ positions.
+        if let Some(new_dimension) = ui.pending_dimension.take() {
+            let old_dimension = sim.params.dimension;
+            sim.set_dimension(new_dimension);
+            ui.nd.normalize(new_dimension);
+            if new_dimension > old_dimension {
+                for d in old_dimension..new_dimension {
+                    ui.extra_slice_centers[d] = sim.params.bounds * 0.5;
+                    ui.extra_slice_thickness[d] = sim.params.bounds;
+                }
+            }
+            ui.selected_indices.clear();
+            ui.clear_selection_requested = true;
+            self.compute.reset_trails();
+            self.compute
+                .clear_trail_history(&mut encoder, crate::sim::MAX_RENDER_PARTICLES);
+            ui.flash(format!("Switched to {}D", sim.params.dimension));
+        }
 
         // Consume a pending "clear selection" request set by the UI this frame
         // (new brush stroke, Clear button, or after a delete shifted indices).
@@ -286,7 +352,21 @@ impl Renderer {
                 .clear_selection(&self.queue, self.compute.particle_count);
         }
 
-        // 2) Upload dirty simulation data after UI may have changed it
+        let steps = ui
+            .playback
+            .steps(ui.paused, std::mem::take(&mut ui.step_once), ui.strobe);
+        if !ui.use_gpu_physics {
+            if sim.particles_replaced || self.compute.particle_count as usize != sim.particles.len()
+            {
+                sim.trace_timers = vec![0; sim.particles.len()];
+            }
+            for _ in 0..steps {
+                sim.step();
+            }
+            if steps > 0 {
+                sim.particles_dirty = true;
+            }
+        }
         if sim.particles_dirty {
             let gpu_particles: Vec<crate::sim::GpuParticle> = sim
                 .particles
@@ -299,7 +379,14 @@ impl Renderer {
             self.compute.upload_particles(&self.queue, &gpu_particles);
 
             // Reset trails if all particles are cleared
-            if particle_count == 0 && old_particle_count > 0 {
+            if particle_count != old_particle_count || sim.particles_replaced {
+                ui.selected_indices.clear();
+                self.compute.clear_selection(&self.queue, particle_count);
+                self.queue.write_buffer(
+                    &self.compute.trace_timer_buf,
+                    0,
+                    bytemuck::cast_slice(&vec![0u32; particle_count as usize]),
+                );
                 self.compute.reset_trails();
                 let temp_encoder = &mut encoder;
                 self.compute
@@ -310,23 +397,33 @@ impl Renderer {
             gpu_params.count = particle_count;
 
             // Safety guard: disable GPU reactions above 10k particles to prevent stalls
-            if ui.use_gpu_physics && sim.params.reactions_enabled && particle_count > 10_000 {
+            if ui.use_gpu_physics
+                && sim.params.reactions_enabled
+                && particle_count > 10_000
+                && gpu_params.grid_res == 0
+            {
                 gpu_params.reactions_enabled = 0; // Force disable reactions in GPU params only
             }
 
             self.compute.upload_params(&self.queue, &gpu_params);
 
             sim.particles_dirty = false;
+            sim.particles_replaced = false;
         }
 
-        if sim.params_dirty {
+        // Params are re-uploaded every frame rather than only when dirty: the
+        // reaction gate needs a fresh frame counter each step, and a 64-byte
+        // uniform write is free next to the physics dispatch.
+        {
             let mut gpu_params = compute::GpuParams::from(&sim.params);
             gpu_params.count = self.compute.particle_count;
+            gpu_params.frame = sim.step_count as u32;
 
             // Safety guard: disable GPU reactions above 10k particles to prevent stalls
             if ui.use_gpu_physics
                 && sim.params.reactions_enabled
                 && self.compute.particle_count > 10_000
+                && gpu_params.grid_res == 0
             {
                 gpu_params.reactions_enabled = 0; // Force disable reactions in GPU params only
             }
@@ -344,8 +441,7 @@ impl Renderer {
             self.compute
                 .upload_reactions(&self.queue, &sim.reaction_table);
             sim.reaction_table_dirty = false;
-            #[cfg(debug_assertions)]
-            println!("[gpu-sync] uploaded reaction_table");
+            log::debug!("uploaded reaction table");
         }
 
         if sim.trace_len_matrix_dirty {
@@ -358,7 +454,10 @@ impl Renderer {
         // points, so the shader gets the viewport in points too. view_proj is
         // last frame's camera (written by draw.rs), which is at most one frame
         // stale — imperceptible for interactive selection.
-        ui.gpu_selection_params.view_proj = ui.view_proj.to_cols_array_2d();
+        let (_, view_matrix, view_proj) = self.draw.build_camera(ui, &screen_desc, sim);
+        ui.view_matrix = view_matrix;
+        ui.view_proj = view_proj;
+        ui.gpu_selection_params.view_proj = view_proj.to_cols_array_2d();
         ui.gpu_selection_params.viewport = [
             self.surface_cfg.width as f32 / screen_desc.pixels_per_point,
             self.surface_cfg.height as f32 / screen_desc.pixels_per_point,
@@ -366,14 +465,18 @@ impl Renderer {
             0.0,
         ];
         ui.gpu_selection_params.mode_flags[1] = self.compute.particle_count;
+        ui.gpu_selection_params.slice_centers = ui.extra_slice_centers;
+        ui.gpu_selection_params.slice_thickness = ui.extra_slice_thickness;
+        ui.gpu_selection_params.dimension_data[0] = sim.params.dimension as u32;
+        ui.gpu_selection_params.projection = ui.nd.packed(sim.params.dimension);
+        ui.gpu_selection_params.projection_data = [sim.params.bounds * 0.5, 0.0, 0.0, 0.0];
         self.compute
             .upload_selection_params(&self.queue, &ui.gpu_selection_params);
 
         // 3) Sync UI state into compute trail parameters
         // Clear trail history when enabling trails mid-sim to avoid garbage
         let trails_enabled =
-            ui.trace_render_mode != crate::ui::TraceRenderMode::Off
-            && !ui.trace_ui_edit_only;
+            ui.trace_render_mode != crate::ui::TraceRenderMode::Off && !ui.trace_ui_edit_only;
         let trails_newly_enabled = trails_enabled && !self.compute.trails_enabled;
         if trails_newly_enabled {
             self.compute.reset_trails();
@@ -382,66 +485,76 @@ impl Renderer {
         }
 
         self.compute.trails_enabled = trails_enabled;
-        let trail_len_changed = ui.trace_len != self.compute.trail_len;
-        self.compute.trail_len = ui.trace_len.clamp(1, compute::MAX_TRAIL);
+        let requested_trail_len = ui.trace_len.clamp(1, self.compute.max_trail);
+        let trail_len_changed = requested_trail_len != self.compute.trail_len;
+        self.compute.trail_len = requested_trail_len;
         if trail_len_changed {
             self.compute.reset_trails();
             self.compute
                 .clear_trail_history(&mut encoder, crate::sim::MAX_RENDER_PARTICLES);
         }
         self.compute.trail_type_filter = ui.trace_type_filter;
-        self.compute.upload_trail_params(&self.queue, ui.trace_trigger_only);
+        self.compute
+            .upload_trail_params(&self.queue, ui.trace_trigger_only, ui.trace_fade_alpha);
 
-        // 4) GPU step - only when GPU physics is enabled
-        if ui.use_gpu_physics && (!ui.paused || ui.step_once) {
-            // Strobe: two sim steps per rendered frame so period-2 oscillating
-            // objects appear frozen (trails also capture stroboscopically). A
-            // manual Step while paused advances one step, flipping the phase.
-            let steps = if ui.strobe && !ui.paused { 2 } else { 1 };
+        if ui.use_gpu_physics && steps > 0 {
             for _ in 0..steps {
+                let mut params = compute::GpuParams::from(&sim.params);
+                params.count = self.compute.particle_count;
+                params.frame = sim.step_count as u32;
+                if params.count > 10_000 && params.grid_res == 0 {
+                    params.reactions_enabled = 0;
+                }
+                self.compute.upload_params(&self.queue, &params);
                 self.compute
-                    .dispatch(&mut encoder, self.compute.particle_count);
-
-                // Swap ping-pong buffers after compute completes
+                    .dispatch_grid(&mut encoder, params.count, params.grid_res);
+                self.compute.dispatch(&mut encoder, params.count);
                 self.compute.swap_particle_buffers();
-
+                self.compute
+                    .dispatch_grid(&mut encoder, params.count, params.grid_res);
+                self.compute.dispatch_reactions(&mut encoder, params.count);
+                self.compute.swap_particle_buffers();
+                // A separate submission orders each substep's uniform write.
+                self.queue.submit([encoder.finish()]);
+                encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Next step / draw"),
+                    });
                 sim.step_count += 1;
             }
-
-            // Update trail capture bind group to use the current particle buffer
+        }
+        if steps > 0 {
+            if !ui.use_gpu_physics {
+                self.queue.write_buffer(
+                    &self.compute.trace_timer_buf,
+                    0,
+                    bytemuck::cast_slice(&sim.trace_timers),
+                );
+            }
             self.compute.update_trail_capture_bind_group(&self.device);
-
-            // Only run complex trail capture for Lines/Dots modes, not Simple mode
             if matches!(
                 ui.trace_render_mode,
                 crate::ui::TraceRenderMode::Lines | crate::ui::TraceRenderMode::Dots
             ) {
-                self.compute.dispatch_trail_capture(&mut encoder);
                 self.compute.advance_trail_head();
-                self.compute.upload_trail_params(&self.queue, ui.trace_trigger_only);
+                self.compute.upload_trail_params(
+                    &self.queue,
+                    ui.trace_trigger_only,
+                    ui.trace_fade_alpha,
+                );
+                self.compute.dispatch_trail_capture(&mut encoder);
             }
+        }
 
-            ui.step_once = false;
-
-            // Debug output - print trail state once per second (roughly)
-            if ui.debug_trails {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static DEBUG_COUNTER: AtomicU32 = AtomicU32::new(0);
-                let counter = DEBUG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                if counter % 60 == 0 {
-                    // Assuming ~60 FPS
-                    let trail_len = self.compute.trail_len;
-                    let valid_segments = if self.compute.trail_valid_len > 1 {
-                        self.compute.trail_valid_len - 1
-                    } else {
-                        0
-                    };
-                    let trail_vertex_count = self.compute.particle_count * valid_segments * 2;
-                    println!("TRAIL DEBUG: particles={}, trail_len={}, head={}, valid_len={}, enabled={}, vertex_count={}", 
-                        self.compute.particle_count, trail_len, self.compute.trail_head,
-                        self.compute.trail_valid_len, self.compute.trails_enabled, trail_vertex_count);
-                }
-            }
+        if ui.debug_trails && steps > 0 && sim.step_count % 60 == 0 {
+            log::debug!(
+                "trail: particles={}, head={}, valid_len={}, enabled={}",
+                self.compute.particle_count,
+                self.compute.trail_head,
+                self.compute.trail_valid_len,
+                self.compute.trails_enabled
+            );
         }
 
         // 5) Selection pass — dedicated compute pass against the current
@@ -518,5 +631,3 @@ impl Renderer {
         output.present();
     }
 }
-
-

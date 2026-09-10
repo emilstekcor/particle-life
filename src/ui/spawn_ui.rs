@@ -82,20 +82,21 @@ pub fn draw_spawn_panel(e: &mut egui::Ui, sim: &mut SimState, ui: &mut UiState) 
     e.horizontal(|e| {
         e.label("Available");
         let mut pool = ui.particle_pool;
-        if e
-            .add(
-                egui::DragValue::new(&mut pool)
-                    .speed(50.0)
-                    .clamp_range(0..=cap),
-            )
-            .on_hover_text(format!("Total pool to draw from (cap {cap})"))
-            .changed()
+        if e.add(
+            egui::DragValue::new(&mut pool)
+                .speed(50.0)
+                .clamp_range(0..=cap),
+        )
+        .on_hover_text(format!("Total pool to draw from (cap {cap})"))
+        .changed()
         {
             ui.particle_pool = pool;
             // Shrinking the pool trims the largest unlocked types first.
             while allocated(ui) > ui.particle_pool {
                 let over = allocated(ui) - ui.particle_pool;
-                let Some(idx) = largest_unlocked(ui, None) else { break };
+                let Some(idx) = largest_unlocked(ui, None) else {
+                    break;
+                };
                 let take = over.min(ui.type_mix[idx]);
                 if take == 0 {
                     break;
@@ -130,8 +131,16 @@ pub fn draw_spawn_panel(e: &mut egui::Ui, sim: &mut SimState, ui: &mut UiState) 
             commit(sim, ui);
             ui.flash("Respawned");
         }
-        if e.button("Match current")
+        // Under GPU physics sim.particles is an intentionally stale mirror and
+        // GPU reactions mutate `kind` without syncing back, so counting it would
+        // report the distribution from whenever GPU physics was switched on.
+        let stale = ui.use_gpu_physics && ui.selected_indices.is_empty();
+        if e.add_enabled(!stale, egui::Button::new("Match current"))
             .on_hover_text("Read the live population back into the chart")
+            .on_disabled_hover_text(
+                "CPU mirror is stale under GPU physics.\n\
+                 Make a selection (which forces a readback) or switch to CPU.",
+            )
             .clicked()
         {
             adopt_current(sim, ui);
@@ -247,7 +256,7 @@ fn draw_donut(e: &mut egui::Ui, sim: &mut SimState, ui: &mut UiState, n: usize) 
         }
     }
 
-    if resp.drag_released() {
+    if resp.drag_stopped() {
         if ui.mix_drag.is_some() {
             commit(sim, ui);
             ui.mix_drag = None;
@@ -344,7 +353,7 @@ fn draw_legend(e: &mut egui::Ui, sim: &mut SimState, ui: &mut UiState, n: usize)
                 }
                 // Respawn on release, not on every frame of a drag — a full
                 // rebuild of 50k particles at 60 fps would be unusable.
-                if resp.drag_released() || resp.lost_focus() {
+                if resp.drag_stopped() || resp.lost_focus() {
                     dirty = true;
                 }
 
@@ -415,7 +424,9 @@ fn adjust(ui: &mut UiState, idx: usize, delta: i64, n: usize) {
 
     // Pool exhausted — steal from the largest unlocked other type.
     while want > 0 {
-        let Some(donor) = largest_unlocked(ui, Some(idx)) else { break };
+        let Some(donor) = largest_unlocked(ui, Some(idx)) else {
+            break;
+        };
         let take = want.min(ui.type_mix[donor]);
         if take == 0 {
             break;
@@ -440,7 +451,13 @@ fn even_split(ui: &mut UiState, n: usize) {
     let each = budget / open.len();
     let mut rem = budget % open.len();
     for i in open {
-        ui.type_mix[i] = each + if rem > 0 { rem -= 1; 1 } else { 0 };
+        ui.type_mix[i] = each
+            + if rem > 0 {
+                rem -= 1;
+                1
+            } else {
+                0
+            };
     }
 }
 
@@ -457,7 +474,13 @@ fn fill_free(ui: &mut UiState, n: usize) {
     let each = free / open.len();
     let mut rem = free % open.len();
     for i in open {
-        ui.type_mix[i] += each + if rem > 0 { rem -= 1; 1 } else { 0 };
+        ui.type_mix[i] += each
+            + if rem > 0 {
+                rem -= 1;
+                1
+            } else {
+                0
+            };
     }
 }
 
@@ -547,7 +570,7 @@ fn stroke_ring(
     a1: f32,
     color: Color32,
 ) {
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     let steps = (((a1 - a0) / 0.10).ceil() as usize).clamp(1, 256);
     let da = (a1 - a0) / steps as f32;
     let mut outer = Vec::with_capacity(steps + 1);
