@@ -1,8 +1,6 @@
-# Particle Life Hyperdimensional 0.3.0
+[# Particle Life Hyperdimensional 0.3.0
 
-A Rust/wgpu particle-life sandbox with 3D–8D physics, audio-driven matrices,
-selection editing, a Creature Book and multidimensional trails. This archive
-contains the complete application source, tests, Cargo.lock and a run script.
+I made particle life and had ai help
 
 ## Run on Nobara / Fedora
 
@@ -162,3 +160,4 @@ cargo build --release --locked
 
 See [VALIDATION.md](VALIDATION.md) for the verification record and remaining
 checks on your Nobara/NVIDIA desktop.
+](https://github.com/emilstekcor/particle-life)
